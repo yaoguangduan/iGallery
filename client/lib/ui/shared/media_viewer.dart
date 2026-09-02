@@ -1,24 +1,37 @@
+import 'dart:async';
+import 'dart:io';
 import 'dart:ui' as ui;
 import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:intl/intl.dart';
+import 'package:flutter/services.dart';
+import 'package:media_kit/media_kit.dart';
+import 'package:media_kit_video/media_kit_video.dart';
 import 'package:photo_view/photo_view.dart';
 import 'package:provider/provider.dart';
-import 'package:video_player/video_player.dart';
 import 'package:image/image.dart' as image_lib;
 
+import '../../core/api.dart';
+import '../../core/disk_cache.dart';
 import '../../core/display_prefs.dart';
+import '../../core/download_service.dart';
 import '../../core/media_service.dart';
+import '../../core/platform.dart';
+import '../../core/time_fmt.dart';
 import '../../theme/app_theme.dart';
 import 'app_kit.dart';
+import 'app_toast.dart';
+import 'cached_thumb.dart';
 
-bool get _isDesktop {
-  final p = defaultTargetPlatform;
-  return p == TargetPlatform.macOS || p == TargetPlatform.windows || p == TargetPlatform.linux;
-}
+bool get _isDesktop => isDesktop;
+
+/// 查看器是"永远深色"的独立空间（YouTube 播放器同理）。
+/// 黑底上主题的 brand(#065FD4) 对比度不足，这里用提亮版本。
+const Color _kViewerAccent = Color(0xFF5B9DFF);
+const Color _kViewerDanger = Color(0xFFFF6B6B);
+const Color _kViewerStar = Color(0xFFFFC107);
 
 class MediaViewer extends StatefulWidget {
   final List<MediaItem> items;
@@ -38,10 +51,12 @@ class _MediaViewerState extends State<MediaViewer> with TickerProviderStateMixin
   late final PageController _pageCtrl;
   late final AnimationController _enterCtrl;
   late int _current;
-  VideoPlayerController? _videoCtrl;
+  Player? _player;
+  VideoController? _videoCtrl;
 
   bool _showUI = true;
-  bool _showDetails = true; // 默认显示详情
+  late bool _showDetails;
+  bool _videoPausedForDetails = false;
   bool _cropMode = false;
   bool _renaming = false;
 
@@ -53,6 +68,7 @@ class _MediaViewerState extends State<MediaViewer> with TickerProviderStateMixin
   void initState() {
     super.initState();
     _current = widget.initialIndex;
+    _showDetails = widget.items[_current].isImage;
     _pageCtrl = PageController(initialPage: _current);
     _enterCtrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 300));
     _enterCtrl.forward();
@@ -64,7 +80,7 @@ class _MediaViewerState extends State<MediaViewer> with TickerProviderStateMixin
   void dispose() {
     _pageCtrl.dispose();
     _enterCtrl.dispose();
-    _videoCtrl?.dispose();
+    _player?.dispose();
     _photoCtrl?.dispose();
     super.dispose();
   }
@@ -85,14 +101,36 @@ class _MediaViewerState extends State<MediaViewer> with TickerProviderStateMixin
   }
 
   void _initVideo() {
-    _videoCtrl?.dispose();
+    _player?.dispose();
+    _player = null;
     _videoCtrl = null;
     _resetPhotoCtrl();
     if (_item.isVideo) {
-      final url = Uri.parse(widget.service.fullUrl(_item.id));
-      _videoCtrl = VideoPlayerController.networkUrl(url)
-        ..initialize().then((_) { if (mounted) setState(() {}); _videoCtrl?.play(); });
+      _player = Player();
+      _videoCtrl = VideoController(_player!);
+      _openVideo(_item);
     }
+  }
+
+  /// 视频：命中缓存直接播本地，否则同时启动播放 (http) 和后台下载
+  void _openVideo(MediaItem item) {
+    final cached = DiskCache.instance.cachedMediaSync(item.id);
+    if (cached != null) {
+      _player?.open(Media(cached.path));
+      return;
+    }
+    _player?.open(Media(
+      widget.service.fullUrl(item.id),
+      httpHeaders: widget.service.authHeaders,
+    ));
+    // 后台缓存（小视频 <= 50MB），播完再看下次就是本地
+    unawaited(DiskCache.instance.getMedia(
+      item.id,
+      widget.service.fullUrl(item.id),
+      widget.service.authHeaders,
+      isVideo: true,
+      knownSize: item.size,
+    ));
   }
 
   // ── 关闭（带动画）──
@@ -134,6 +172,52 @@ class _MediaViewerState extends State<MediaViewer> with TickerProviderStateMixin
     });
   }
 
+  Future<void> _toggleFavorite() async {
+    final item = _item;
+    final target = !item.isFavorite;
+    try {
+      final updated = await widget.service.updateFields(item.id, {'favorite': target});
+      final idx = widget.items.indexWhere((m) => m.id == item.id);
+      if (idx >= 0) {
+        widget.items[idx] = updated ?? item.copyWith(favorite: target ? 1 : 0);
+      }
+      if (mounted) setState(() {});
+    } on ApiException catch (e) {
+      if (mounted) showToast(context, '操作失败: ${e.userMessage}', kind: ToastKind.error);
+    }
+  }
+
+  void _toggleDetails() {
+    setState(() {
+      _showDetails = !_showDetails;
+      if (!_isImage && _player != null) {
+        if (_showDetails) {
+          _player!.pause();
+          _videoPausedForDetails = true;
+        } else if (_videoPausedForDetails) {
+          _player!.play();
+          _videoPausedForDetails = false;
+        }
+      }
+    });
+  }
+
+  Future<void> _downloadCurrent() async {
+    final item = _item;
+    try {
+      final savePath = await DownloadService.instance
+          .downloadSingle(widget.service, item.id, item.filename);
+      if (!mounted) return;
+      if (savePath == null) return; // 用户取消
+      final name = savePath.split(Platform.pathSeparator).last;
+      showToast(context, '已下载 $name', kind: ToastKind.success);
+    } on ApiException catch (e) {
+      if (mounted) showToast(context, '下载失败: ${e.userMessage}', kind: ToastKind.error);
+    } catch (_) {
+      if (mounted) showToast(context, '下载失败', kind: ToastKind.error);
+    }
+  }
+
   Future<void> _rename() async {
     final c = context.colors;
     final result = await showDialog<String>(context: context, builder: (ctx) {
@@ -143,7 +227,7 @@ class _MediaViewerState extends State<MediaViewer> with TickerProviderStateMixin
         content: TextField(controller: ctrl, autofocus: true,
             style: TextStyle(color: c.onSurface, fontSize: AppType.md),
             decoration: InputDecoration(filled: true, fillColor: c.surface2,
-                border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide.none))),
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(AppRadius.chip), borderSide: BorderSide.none))),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx), child: Text('取消', style: TextStyle(color: c.onSurfaceVariant))),
           TextButton(onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
@@ -152,24 +236,16 @@ class _MediaViewerState extends State<MediaViewer> with TickerProviderStateMixin
       );
     });
     if (result != null && result.isNotEmpty && result != _item.filename && mounted) {
-      await widget.service.updateFields(_item.id, {'filename': result});
-      // 刷新本地数据
-      final idx = widget.items.indexWhere((m) => m.id == _item.id);
-      if (idx >= 0) {
-        widget.items[idx] = MediaItem.fromJson({
-          ...{
-            'id': _item.id, 'filename': result, 'ext': _item.ext,
-            'mime': _item.mime, 'media_type': _item.mediaType,
-            'size': _item.size, 'width': _item.width, 'height': _item.height,
-            'taken_at': _item.takenAt, 'created_at': _item.createdAt,
-            'updated_at': _item.updatedAt,
-            'exif_make': _item.exifMake, 'exif_model': _item.exifModel,
-            'exif_gps_lat': _item.exifGpsLat, 'exif_gps_lng': _item.exifGpsLng,
-            'favorite': _item.favorite, 'tags': _item.tags, 'notes': _item.notes,
-          }
-        });
+      try {
+        final updated = await widget.service.updateFields(_item.id, {'filename': result});
+        final idx = widget.items.indexWhere((m) => m.id == _item.id);
+        if (idx >= 0) {
+          widget.items[idx] = updated ?? _item.copyWith(filename: result);
+        }
+        if (mounted) setState(() {});
+      } on ApiException catch (e) {
+        if (mounted) showToast(context, '重命名失败: ${e.userMessage}', kind: ToastKind.error);
       }
-      setState(() {});
     }
   }
 
@@ -225,10 +301,11 @@ class _MediaViewerState extends State<MediaViewer> with TickerProviderStateMixin
         : '${item.filename.replaceAll(RegExp(r'\.[^.]+$'), '')}_cropped.$ext';
 
     // 上传裁剪后的图片
-    final newItem = await widget.service.uploadBytes(
-      bytes: cropped, filename: newFilename, takenAt: takenAt);
+    final result = await widget.service.uploadBytes(
+      bytes: cropped, filename: newFilename, takenAt: takenAt, folderId: item.folderId);
 
-    if (newItem == null || !mounted) return;
+    if (result == null || !mounted) return;
+    final newItem = result.item;
 
     if (mode == CropSaveMode.overwrite) {
       // 删除原图
@@ -255,10 +332,13 @@ class _MediaViewerState extends State<MediaViewer> with TickerProviderStateMixin
     if (b < 1024 * 1024) return '${(b / 1024).toStringAsFixed(1)} KB';
     return '${(b / (1024 * 1024)).toStringAsFixed(1)} MB';
   }
-  String _fmtDate(String? s) {
-    if (s == null) return '';
-    final d = DateTime.tryParse(s);
-    return d != null ? DateFormat('yyyy-MM-dd HH:mm:ss').format(d) : s;
+  String _fmtDate(String? s) => fmtDateTime(s);
+
+  String _fmtDuration(double secs) {
+    final d = Duration(seconds: secs.round());
+    final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return d.inHours > 0 ? '${d.inHours}:$m:$s' : '$m:$s';
   }
 
   @override
@@ -268,10 +348,33 @@ class _MediaViewerState extends State<MediaViewer> with TickerProviderStateMixin
     final prefs = context.watch<DisplayPrefs>();
     final transition = prefs.viewerTransition;
 
+    Widget viewer = _buildContent(c, mq);
+
+    // mobile: edge swipe to close
+    if (!_isDesktop) {
+      viewer = GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onHorizontalDragEnd: (details) {
+          if ((details.primaryVelocity ?? 0) > 300) _close();
+        },
+        child: viewer,
+      );
+    }
+
     Widget content = PopScope(
       canPop: false,
       onPopInvokedWithResult: (didPop, _) { if (!didPop) _close(); },
-      child: _buildContent(c, mq),
+      child: Focus(
+        autofocus: true,
+        onKeyEvent: (_, event) {
+          if (event is KeyDownEvent && event.logicalKey == LogicalKeyboardKey.escape) {
+            _close();
+            return KeyEventResult.handled;
+          }
+          return KeyEventResult.ignored;
+        },
+        child: viewer,
+      ),
     );
 
     // 进入/退出动画
@@ -280,16 +383,21 @@ class _MediaViewerState extends State<MediaViewer> with TickerProviderStateMixin
         content = FadeTransition(opacity: _enterCtrl, child: content);
       case ViewerTransition.scale:
         content = ScaleTransition(scale: CurvedAnimation(parent: _enterCtrl, curve: Curves.easeOutCubic), child: content);
-      case ViewerTransition.slide:
-        content = SlideTransition(
-          position: Tween(begin: const Offset(0, 1), end: Offset.zero)
-              .animate(CurvedAnimation(parent: _enterCtrl, curve: Curves.easeOutCubic)),
-          child: content);
       case ViewerTransition.none:
         break;
     }
 
-    return content;
+    // 查看器是深色全屏，状态栏随之变深色（与主页亮色状态栏区分）
+    return AnnotatedRegion<SystemUiOverlayStyle>(
+      value: const SystemUiOverlayStyle(
+        statusBarColor: Colors.black,
+        statusBarIconBrightness: Brightness.light,  // Android
+        statusBarBrightness: Brightness.dark,       // iOS
+        systemNavigationBarColor: Colors.black,
+        systemNavigationBarIconBrightness: Brightness.light,
+      ),
+      child: content,
+    );
   }
 
   Widget _buildContent(AppColors c, MediaQueryData mq) {
@@ -311,40 +419,52 @@ class _MediaViewerState extends State<MediaViewer> with TickerProviderStateMixin
           if (_cropMode && _isImage)
             _CropView(
               imageUrl: widget.service.fullUrl(_item.id),
+              headers: widget.service.authHeaders,
               onCancel: () => setState(() => _cropMode = false),
               onCrop: (cropRect, dispSize) => _executeCrop(cropRect, dispSize),
             )
           else
             Positioned.fill(
-              child: GestureDetector(
-                onTap: () => setState(() => _showUI = !_showUI),
-                onDoubleTap: _isImage ? () { _zoomPercent > 110 ? _resetZoom() : _zoomByPercent(50); } : null,
-                child: PageView.builder(
-                  controller: _pageCtrl,
-                  itemCount: widget.items.length,
-                  onPageChanged: (i) {
-                    setState(() { _current = i; _cropMode = false; });
-                    _initVideo();
-                  },
-                  itemBuilder: (_, i) {
-                    final item = widget.items[i];
-                    if (item.isVideo && i == _current && _videoCtrl != null) {
-                      return _VideoView(controller: _videoCtrl!);
-                    }
-                    return PhotoView(
+              child: PageView.builder(
+                controller: _pageCtrl,
+                itemCount: widget.items.length,
+                onPageChanged: (i) {
+                  setState(() {
+                    _current = i; _cropMode = false;
+                    _videoPausedForDetails = false;
+                    _showDetails = widget.items[i].isImage;
+                  });
+                  _initVideo();
+                },
+                itemBuilder: (_, i) {
+                  final item = widget.items[i];
+                  if (item.isVideo && i == _current && _videoCtrl != null && _player != null) {
+                    return _VideoView(
+                      player: _player!,
+                      controller: _videoCtrl!,
+                    );
+                  }
+                  return GestureDetector(
+                    onTap: () => setState(() => _showUI = !_showUI),
+                    onDoubleTap: () { _zoomPercent > 110 ? _resetZoom() : _zoomByPercent(50); },
+                    child: PhotoView(
                       controller: i == _current ? _photoCtrl : null,
-                      imageProvider: NetworkImage(widget.service.fullUrl(item.id)),
+                      imageProvider: NetworkImage(
+                        widget.service.fullUrl(item.id),
+                        headers: widget.service.authHeaders,
+                      ),
                       backgroundDecoration: const BoxDecoration(color: Colors.transparent),
                       minScale: PhotoViewComputedScale.contained * 0.5,
                       maxScale: PhotoViewComputedScale.covered * 5,
                       initialScale: PhotoViewComputedScale.contained,
                       loadingBuilder: (_, event) => Center(child: SizedBox(width: 22, height: 22,
-                          child: CircularProgressIndicator(strokeWidth: 2, color: c.brand,
+                          child: CircularProgressIndicator(strokeWidth: 2, color: _kViewerAccent,
                               value: event == null ? null : event.cumulativeBytesLoaded / (event.expectedTotalBytes ?? 1)))),
-                      errorBuilder: (_, __, ___) => Center(child: Icon(Icons.broken_image, color: c.onMuted, size: 48)),
-                    );
-                  },
-                ),
+                      errorBuilder: (_, __, ___) => const Center(
+                          child: Icon(Icons.broken_image, color: Colors.white30, size: 48)),
+                    ),
+                  );
+                },
               ),
             ),
 
@@ -369,10 +489,10 @@ class _MediaViewerState extends State<MediaViewer> with TickerProviderStateMixin
                 padding: EdgeInsets.only(top: mq.padding.top + 4, left: 4, right: 4, bottom: 12),
                 child: Row(children: [
                   _IcoBtn(Icons.close, onTap: _close, tooltip: '关闭'),
-                  const Spacer(),
-                  Text('${_current + 1}/${widget.items.length}',
-                      style: const TextStyle(color: Colors.white38, fontSize: 12)),
-                  const Spacer(),
+                  const SizedBox(width: 4),
+                  Expanded(child: Text(_item.filename, maxLines: 1, overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(color: Colors.white70, fontSize: 12))),
+                  const SizedBox(width: 4),
                   if (_isImage) ...[
                     Container(
                       padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
@@ -384,16 +504,22 @@ class _MediaViewerState extends State<MediaViewer> with TickerProviderStateMixin
                     _IcoBtn(Icons.add, onTap: _zoomIn, tooltip: '放大'),
                     _IcoBtn(Icons.crop, onTap: () => setState(() => _cropMode = true), tooltip: '裁剪'),
                   ],
+                  _IcoBtn(
+                    _item.isFavorite ? Icons.star : Icons.star_border,
+                    onTap: _toggleFavorite,
+                    color: _item.isFavorite ? _kViewerStar : null,
+                    tooltip: _item.isFavorite ? '取消收藏' : '收藏'),
+                  _IcoBtn(Icons.file_download_outlined, onTap: _downloadCurrent, tooltip: '下载'),
                   _IcoBtn(Icons.edit_outlined, onTap: _rename, tooltip: '重命名'),
                   _IcoBtn(_showDetails ? Icons.info : Icons.info_outline,
-                      onTap: () => setState(() => _showDetails = !_showDetails),
-                      color: _showDetails ? c.brand : null, tooltip: '详情'),
-                  _IcoBtn(Icons.delete_outline, onTap: _delete, color: c.error, tooltip: '删除'),
+                      onTap: _toggleDetails,
+                      color: _showDetails ? _kViewerAccent : null, tooltip: '详情'),
+                  _IcoBtn(Icons.delete_outline, onTap: _delete, color: _kViewerDanger, tooltip: '删除'),
                 ]),
               ),
             )),
 
-          // 底部详情
+          // 底部详情（视频时暂停播放后显示）
           if (_showUI && _showDetails && !_cropMode)
             Positioned(bottom: 0, left: 0, right: 0, child: AnimatedOpacity(
               opacity: 1.0, duration: const Duration(milliseconds: 150),
@@ -405,6 +531,7 @@ class _MediaViewerState extends State<MediaViewer> with TickerProviderStateMixin
                 child: _buildDetails(c),
               ),
             )),
+
         ],
       ),
     );
@@ -417,6 +544,7 @@ class _MediaViewerState extends State<MediaViewer> with TickerProviderStateMixin
       ('类型', '${item.mediaType} · ${item.mime}'),
       ('大小', _fmtSize(item.size)),
       if (item.width != null && item.height != null) ('尺寸', '${item.width}×${item.height}'),
+      if (item.duration != null) ('时长', _fmtDuration(item.duration!)),
       if (item.takenAt != null) ('拍摄时间', _fmtDate(item.takenAt)),
       ('上传时间', _fmtDate(item.createdAt)),
       if (item.exifMake != null || item.exifModel != null)
@@ -481,9 +609,15 @@ class _ArrowBtn extends StatelessWidget {
 
 class _CropView extends StatefulWidget {
   final String imageUrl;
+  final Map<String, String> headers;
   final VoidCallback onCancel;
   final void Function(Rect cropRect, Size displaySize) onCrop;
-  const _CropView({required this.imageUrl, required this.onCancel, required this.onCrop});
+  const _CropView({
+    required this.imageUrl,
+    this.headers = const {},
+    required this.onCancel,
+    required this.onCrop,
+  });
 
   @override
   State<_CropView> createState() => _CropViewState();
@@ -502,7 +636,7 @@ class _CropViewState extends State<_CropView> {
   @override
   void initState() {
     super.initState();
-    final provider = NetworkImage(widget.imageUrl);
+    final provider = NetworkImage(widget.imageUrl, headers: widget.headers);
     provider.resolve(const ImageConfiguration()).addListener(ImageStreamListener((info, _) {
       if (!mounted) return;
       WidgetsBinding.instance.addPostFrameCallback((_) => _layout(
@@ -574,13 +708,12 @@ class _CropViewState extends State<_CropView> {
 
   @override
   Widget build(BuildContext context) {
-    final c = context.colors;
     if (!_ready) return const Center(child: AppSpinner());
 
     return Column(children: [
       Expanded(child: Stack(children: [
         Positioned(left: _dispOffset.dx, top: _dispOffset.dy, width: _dispSize.width, height: _dispSize.height,
-            child: Image.network(widget.imageUrl, fit: BoxFit.contain)),
+            child: Image.network(widget.imageUrl, fit: BoxFit.contain, headers: widget.headers)),
         Positioned(left: _dispOffset.dx, top: _dispOffset.dy, width: _dispSize.width, height: _dispSize.height,
           child: GestureDetector(
             onPanStart: (d) => _activeHandle = _hitTest(d.localPosition),
@@ -593,7 +726,7 @@ class _CropViewState extends State<_CropView> {
       Container(color: Colors.black, padding: EdgeInsets.only(bottom: MediaQuery.of(context).padding.bottom + 8, top: 8),
         child: Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
           TextButton(onPressed: widget.onCancel, child: const Text('取消', style: TextStyle(color: Colors.white70, fontSize: 14))),
-          TextButton(onPressed: () => widget.onCrop(_crop, _dispSize), child: Text('裁剪', style: TextStyle(color: c.brand, fontSize: 14, fontWeight: FontWeight.w600))),
+          TextButton(onPressed: () => widget.onCrop(_crop, _dispSize), child: const Text('裁剪', style: TextStyle(color: _kViewerAccent, fontSize: 14, fontWeight: FontWeight.w600))),
         ])),
     ]);
   }
@@ -662,28 +795,97 @@ Uint8List? _cropImage(_CropParams p) {
   }
 }
 
-// ── 视频 ──
+// ── 视频（media_kit 全平台播放器）──
 
-class _VideoView extends StatelessWidget {
-  final VideoPlayerController controller;
-  const _VideoView({required this.controller});
+class _VideoView extends StatefulWidget {
+  final Player player;
+  final VideoController controller;
+  const _VideoView({super.key, required this.player, required this.controller});
+
+  @override
+  State<_VideoView> createState() => _VideoViewState();
+}
+
+class _VideoViewState extends State<_VideoView> {
+  static const _speeds = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+  double _speed = 1.0;
+
+  void _cycleSpeed() {
+    final idx = _speeds.indexOf(_speed);
+    final next = _speeds[(idx + 1) % _speeds.length];
+    widget.player.setRate(next);
+    setState(() => _speed = next);
+  }
+
+  Widget _speedButton({Color color = Colors.white}) {
+    final label = _speed == 1.0 ? '1x' : '${_speed}x';
+    return MaterialCustomButton(
+      onPressed: _cycleSpeed,
+      icon: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        child: Text(label, style: TextStyle(
+          color: _speed == 1.0 ? color.withValues(alpha: 0.7) : const Color(0xFF6B8AFF),
+          fontSize: 12, fontWeight: FontWeight.w600,
+        )),
+      ),
+    );
+  }
+
+  Widget _desktopSpeedButton() {
+    final label = _speed == 1.0 ? '1x' : '${_speed}x';
+    return MaterialDesktopCustomButton(
+      onPressed: _cycleSpeed,
+      icon: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        child: Text(label, style: TextStyle(
+          color: _speed == 1.0 ? Colors.white70 : _kViewerAccent,
+          fontSize: 12, fontWeight: FontWeight.w600,
+        )),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
-    if (!controller.value.isInitialized) return const Center(child: AppSpinner());
-    return Center(child: AspectRatio(aspectRatio: controller.value.aspectRatio,
-        child: Stack(alignment: Alignment.center, children: [
-          VideoPlayer(controller),
-          GestureDetector(
-            onTap: () => controller.value.isPlaying ? controller.pause() : controller.play(),
-            child: ValueListenableBuilder<VideoPlayerValue>(
-              valueListenable: controller,
-              builder: (_, v, __) => v.isPlaying ? const SizedBox.shrink() : Container(
-                width: 56, height: 56,
-                decoration: const BoxDecoration(color: Colors.black45, shape: BoxShape.circle),
-                child: const Icon(Icons.play_arrow, size: 36, color: Colors.white)),
-            ),
-          ),
-        ])));
+    final bottomPad = MediaQuery.of(context).padding.bottom;
+    final theme = MaterialVideoControlsThemeData(
+      bottomButtonBarMargin: EdgeInsets.only(left: 12, right: 12, bottom: bottomPad + 8),
+      seekBarMargin: const EdgeInsets.only(left: 12, right: 12, bottom: 4),
+      seekBarThumbColor: const Color(0xFF6B8AFF),
+      seekBarColor: const Color(0xFF6B8AFF),
+      bottomButtonBar: [
+        const MaterialPositionIndicator(),
+        const Spacer(),
+        _speedButton(),
+        const MaterialFullscreenButton(),
+      ],
+    );
+    final desktopTheme = MaterialDesktopVideoControlsThemeData(
+      seekBarThumbColor: const Color(0xFF6B8AFF),
+      seekBarPositionColor: const Color(0xFF6B8AFF),
+      bottomButtonBar: [
+        const MaterialDesktopSkipPreviousButton(),
+        const MaterialDesktopPlayOrPauseButton(),
+        const MaterialDesktopSkipNextButton(),
+        const MaterialDesktopVolumeButton(),
+        const MaterialDesktopPositionIndicator(),
+        const Spacer(),
+        _desktopSpeedButton(),
+        const MaterialDesktopFullscreenButton(),
+      ],
+    );
+
+    return MaterialVideoControlsTheme(
+      normal: theme,
+      fullscreen: theme,
+      child: MaterialDesktopVideoControlsTheme(
+        normal: desktopTheme,
+        fullscreen: desktopTheme,
+        child: Video(
+          controller: widget.controller,
+          controls: _isDesktop ? MaterialDesktopVideoControls : MaterialVideoControls,
+        ),
+      ),
+    );
   }
 }

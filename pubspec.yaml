@@ -1,0 +1,43 @@
+name: igallery
+description: 局域网相册 — 照片视频管理工具
+publish_to: 'none'
+# The +<code> build number is required, not cosmetic: without it Flutter falls
+# back to using the build NAME as the build number, which the Android Gradle
+# plugin cannot parse as an integer, so it silently ships versionCode 1. A frozen
+# +1 has the same effect by hand. Both halves are maintained by tool/ship.sh
+# (code = major*10000 + minor*100 + patch).
+version: 0.1.3+103
+
+environment:
+  sdk: ^3.10.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  provider: ^6.1.5
+  http: ^1.6.0
+  bonsoir: ^7.1.5
+  file_picker: ^12.1.3
+  media_kit: ^1.2.6
+  media_kit_video: ^2.0.1
+  media_kit_libs_video: ^1.0.7
+  photo_view: ^0.15.0
+  path_provider: ^2.1.6
+  intl: ^0.20.3
+  lpinyin: ^2.0.3
+  http_parser: ^4.1.0
+  image: ^4.3.0
+  sqflite: ^2.4.1
+  sqflite_common_ffi: ^2.3.4
+  path: ^1.9.0
+  crypto: ^3.0.6
+  connectivity_plus: ^6.1.0
+  uuid: ^4.5.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true

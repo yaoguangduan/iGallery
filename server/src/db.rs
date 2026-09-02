@@ -1,26 +1,37 @@
 use serde::{Deserialize, Serialize};
-use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
+use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
 use std::path::Path;
+
+use crate::time::now_rfc3339;
 
 // ── schema ──
 
-pub async fn init_pool(data_dir: &Path) -> SqlitePool {
+pub async fn init_pool(data_dir: &Path) -> Result<SqlitePool, sqlx::Error> {
     let db_path = data_dir.join("gallery.db");
     let url = format!("sqlite:{}?mode=rwc", db_path.display());
 
     let pool = SqlitePoolOptions::new()
-        .max_connections(4)
+        .max_connections(16)
         .connect(&url)
-        .await
-        .expect("failed to connect to SQLite");
+        .await?;
 
-    sqlx::query(SCHEMA).execute(&pool).await.expect("failed to create table");
+    // SQLite 优化：WAL + NORMAL + 5s busy timeout
+    sqlx::query("PRAGMA journal_mode=WAL").execute(&pool).await.ok();
+    sqlx::query("PRAGMA synchronous=NORMAL").execute(&pool).await.ok();
+    sqlx::query("PRAGMA busy_timeout=5000").execute(&pool).await.ok();
+    sqlx::query("PRAGMA foreign_keys=ON").execute(&pool).await.ok();
+
+    sqlx::query(SCHEMA).execute(&pool).await?;
+    sqlx::query(FOLDERS_SCHEMA).execute(&pool).await?;
 
     for idx in INDEXES {
         sqlx::query(idx).execute(&pool).await.ok();
     }
+    for idx in FOLDER_INDEXES {
+        sqlx::query(idx).execute(&pool).await.ok();
+    }
 
-    pool
+    Ok(pool)
 }
 
 const SCHEMA: &str = "
@@ -29,38 +40,45 @@ CREATE TABLE IF NOT EXISTS media (
     filename      TEXT NOT NULL,
     ext           TEXT NOT NULL DEFAULT '',
     mime          TEXT NOT NULL,
-    media_type    TEXT NOT NULL DEFAULT 'image',  -- image / video / audio / other
+    media_type    TEXT NOT NULL DEFAULT 'image',
     size          INTEGER NOT NULL DEFAULT 0,
     width         INTEGER,
     height        INTEGER,
-    duration      REAL,                           -- seconds (video/audio)
-    orientation   INTEGER,                        -- EXIF 1-8
+    duration      REAL,
+    orientation   INTEGER,
 
-    taken_at      TEXT,                           -- capture time (EXIF > client mtime > upload)
-    created_at    TEXT NOT NULL,                  -- upload time
+    taken_at      TEXT,
+    created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL,
-    deleted_at    TEXT,                           -- soft delete: NULL = active
+    deleted_at    TEXT,
 
-    checksum      TEXT,                           -- SHA256
+    checksum      TEXT,
 
-    -- EXIF camera info
     exif_make     TEXT,
     exif_model    TEXT,
     exif_lens     TEXT,
-    exif_focal_length REAL,                       -- mm
-    exif_aperture REAL,                           -- f-number
+    exif_focal_length REAL,
+    exif_aperture REAL,
     exif_iso      INTEGER,
-    exif_exposure TEXT,                            -- e.g. '1/125'
+    exif_exposure TEXT,
 
-    -- GPS
     exif_gps_lat  REAL,
     exif_gps_lng  REAL,
 
-    -- user data
-    favorite      INTEGER NOT NULL DEFAULT 0,     -- 0/1
-    tags          TEXT NOT NULL DEFAULT '[]',      -- JSON array
+    favorite      INTEGER NOT NULL DEFAULT 0,
+    tags          TEXT NOT NULL DEFAULT '[]',
     notes         TEXT NOT NULL DEFAULT '',
-    has_thumb     INTEGER NOT NULL DEFAULT 0
+    has_thumb     INTEGER NOT NULL DEFAULT 0,
+    folder_id     TEXT
+)";
+
+const FOLDERS_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS folders (
+    id         TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    parent_id  TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 )";
 
 const INDEXES: &[&str] = &[
@@ -75,16 +93,23 @@ const INDEXES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_media_favorite    ON media(favorite)",
     "CREATE INDEX IF NOT EXISTS idx_media_checksum    ON media(checksum)",
     "CREATE INDEX IF NOT EXISTS idx_media_gps         ON media(exif_gps_lat, exif_gps_lng)",
+    "CREATE INDEX IF NOT EXISTS idx_media_folder_id   ON media(folder_id)",
+];
+
+const FOLDER_INDEXES: &[&str] = &[
+    "CREATE INDEX IF NOT EXISTS idx_folders_parent_id ON folders(parent_id)",
 ];
 
 // ── row ──
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct MediaRow {
     pub id: String,
     pub filename: String,
+    #[serde(default)]
     pub ext: String,
     pub mime: String,
+    #[serde(default = "default_media_type")]
     pub media_type: String,
     pub size: i64,
     pub width: Option<i32>,
@@ -109,54 +134,30 @@ pub struct MediaRow {
     pub tags: String,
     pub notes: String,
     pub has_thumb: i32,
+    pub folder_id: Option<String>,
 }
 
-impl sqlx::FromRow<'_, sqlx::sqlite::SqliteRow> for MediaRow {
-    fn from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
-        use sqlx::Row;
-        Ok(Self {
-            id: row.try_get("id")?,
-            filename: row.try_get("filename")?,
-            ext: row.try_get::<String, _>("ext").unwrap_or_default(),
-            mime: row.try_get("mime")?,
-            media_type: row.try_get::<String, _>("media_type").unwrap_or_else(|_| "image".into()),
-            size: row.try_get("size")?,
-            width: row.try_get("width")?,
-            height: row.try_get("height")?,
-            duration: row.try_get("duration").ok(),
-            orientation: row.try_get("orientation").ok(),
-            taken_at: row.try_get("taken_at")?,
-            created_at: row.try_get("created_at")?,
-            updated_at: row.try_get::<String, _>("updated_at").unwrap_or_default(),
-            deleted_at: row.try_get("deleted_at").ok().flatten(),
-            checksum: row.try_get("checksum")?,
-            exif_make: row.try_get("exif_make").ok().flatten(),
-            exif_model: row.try_get("exif_model").ok().flatten(),
-            exif_lens: row.try_get("exif_lens").ok().flatten(),
-            exif_focal_length: row.try_get("exif_focal_length").ok().flatten(),
-            exif_aperture: row.try_get("exif_aperture").ok().flatten(),
-            exif_iso: row.try_get("exif_iso").ok().flatten(),
-            exif_exposure: row.try_get("exif_exposure").ok().flatten(),
-            exif_gps_lat: row.try_get("exif_gps_lat").ok().flatten(),
-            exif_gps_lng: row.try_get("exif_gps_lng").ok().flatten(),
-            favorite: row.try_get::<i32, _>("favorite").unwrap_or(0),
-            tags: row.try_get::<String, _>("tags").unwrap_or_else(|_| "[]".into()),
-            notes: row.try_get::<String, _>("notes").unwrap_or_default(),
-            has_thumb: row.try_get::<i32, _>("has_thumb").unwrap_or(0),
-        })
-    }
+fn default_media_type() -> String { "image".into() }
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct FolderRow {
+    pub id: String,
+    pub name: String,
+    pub parent_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 // ── CRUD ──
 
-const ALL_COLS: &str = "id,filename,ext,mime,media_type,size,width,height,duration,orientation,\
+pub const ALL_COLS: &str = "id,filename,ext,mime,media_type,size,width,height,duration,orientation,\
 taken_at,created_at,updated_at,deleted_at,checksum,\
 exif_make,exif_model,exif_lens,exif_focal_length,exif_aperture,exif_iso,exif_exposure,\
-exif_gps_lat,exif_gps_lng,favorite,tags,notes,has_thumb";
+exif_gps_lat,exif_gps_lng,favorite,tags,notes,has_thumb,folder_id";
 
-pub async fn insert_media(pool: &SqlitePool, r: &MediaRow) {
+pub async fn insert_media(pool: &SqlitePool, r: &MediaRow) -> Result<(), sqlx::Error> {
     sqlx::query(&format!(
-        "INSERT OR REPLACE INTO media ({ALL_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        "INSERT OR REPLACE INTO media ({ALL_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
     ))
     .bind(&r.id).bind(&r.filename).bind(&r.ext).bind(&r.mime).bind(&r.media_type)
     .bind(r.size).bind(r.width).bind(r.height).bind(r.duration).bind(r.orientation)
@@ -164,51 +165,99 @@ pub async fn insert_media(pool: &SqlitePool, r: &MediaRow) {
     .bind(&r.exif_make).bind(&r.exif_model).bind(&r.exif_lens).bind(r.exif_focal_length).bind(r.exif_aperture)
     .bind(r.exif_iso).bind(&r.exif_exposure)
     .bind(r.exif_gps_lat).bind(r.exif_gps_lng)
-    .bind(r.favorite).bind(&r.tags).bind(&r.notes).bind(r.has_thumb)
-    .execute(pool).await.expect("insert failed");
+    .bind(r.favorite).bind(&r.tags).bind(&r.notes).bind(r.has_thumb).bind(&r.folder_id)
+    .execute(pool).await?;
+    Ok(())
 }
 
-pub async fn get_media(pool: &SqlitePool, id: &str) -> Option<MediaRow> {
+pub async fn get_media(pool: &SqlitePool, id: &str) -> Result<Option<MediaRow>, sqlx::Error> {
     sqlx::query_as::<_, MediaRow>(&format!("SELECT {ALL_COLS} FROM media WHERE id = ?"))
-        .bind(id).fetch_optional(pool).await.ok().flatten()
+        .bind(id)
+        .fetch_optional(pool)
+        .await
 }
 
-pub async fn soft_delete(pool: &SqlitePool, id: &str) -> bool {
-    let now = chrono::Utc::now().to_rfc3339();
+pub async fn soft_delete(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
+    let now = now_rfc3339();
     let r = sqlx::query("UPDATE media SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL")
-        .bind(&now).bind(&now).bind(id).execute(pool).await;
-    matches!(r, Ok(r) if r.rows_affected() > 0)
+        .bind(&now).bind(&now).bind(id).execute(pool).await?;
+    Ok(r.rows_affected() > 0)
 }
 
-pub async fn hard_delete(pool: &SqlitePool, id: &str) -> bool {
-    let r = sqlx::query("DELETE FROM media WHERE id = ?")
-        .bind(id).execute(pool).await;
-    matches!(r, Ok(r) if r.rows_affected() > 0)
+pub async fn soft_delete_many(pool: &SqlitePool, ids: &[String]) -> Result<u64, sqlx::Error> {
+    if ids.is_empty() { return Ok(0); }
+    let mut total = 0u64;
+    // SQLite 参数上限 999，分批
+    for chunk in ids.chunks(500) {
+        let placeholders = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+        let now = now_rfc3339();
+        let sql = format!(
+            "UPDATE media SET deleted_at = ?, updated_at = ? WHERE deleted_at IS NULL AND id IN ({placeholders})"
+        );
+        let mut q = sqlx::query(&sql).bind(&now).bind(&now);
+        for id in chunk { q = q.bind(id); }
+        total += q.execute(pool).await?.rows_affected();
+    }
+    Ok(total)
 }
 
-pub async fn restore(pool: &SqlitePool, id: &str) -> bool {
-    let now = chrono::Utc::now().to_rfc3339();
+pub async fn restore(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
+    let now = now_rfc3339();
     let r = sqlx::query("UPDATE media SET deleted_at = NULL, updated_at = ? WHERE id = ? AND deleted_at IS NOT NULL")
-        .bind(&now).bind(id).execute(pool).await;
-    matches!(r, Ok(r) if r.rows_affected() > 0)
+        .bind(&now).bind(id).execute(pool).await?;
+    Ok(r.rows_affected() > 0)
 }
 
-pub async fn update_fields(pool: &SqlitePool, id: &str, sets: &[(String, String)]) -> bool {
-    if sets.is_empty() { return false; }
-    let assigns: Vec<String> = sets.iter().map(|(k, _)| format!("{k} = ?")).collect();
-    let now = chrono::Utc::now().to_rfc3339();
-    let sql = format!("UPDATE media SET {}, updated_at = ? WHERE id = ?", assigns.join(", "));
+/// 强类型字段更新（防止 M4 的类型混乱）
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct UpdateFields {
+    pub filename: Option<String>,
+    pub favorite: Option<bool>,
+    pub tags: Option<serde_json::Value>,   // JSON 数组
+    pub notes: Option<String>,
+    /// null = 移到根；缺省 = 不改
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folder_id: Option<Option<String>>,
+}
+
+impl UpdateFields {
+    pub fn is_empty(&self) -> bool {
+        self.filename.is_none()
+            && self.favorite.is_none()
+            && self.tags.is_none()
+            && self.notes.is_none()
+            && self.folder_id.is_none()
+    }
+}
+
+pub async fn update_fields(pool: &SqlitePool, id: &str, f: &UpdateFields) -> Result<bool, sqlx::Error> {
+    if f.is_empty() { return Ok(false); }
+
+    let mut sets: Vec<&str> = Vec::new();
+    if f.filename.is_some()  { sets.push("filename = ?"); }
+    if f.favorite.is_some()  { sets.push("favorite = ?"); }
+    if f.tags.is_some()      { sets.push("tags = ?"); }
+    if f.notes.is_some()     { sets.push("notes = ?"); }
+    if f.folder_id.is_some() { sets.push("folder_id = ?"); }
+    sets.push("updated_at = ?");
+
+    let sql = format!("UPDATE media SET {} WHERE id = ?", sets.join(", "));
     let mut q = sqlx::query(&sql);
-    for (_, v) in sets { q = q.bind(v); }
-    q = q.bind(&now).bind(id);
-    let r = q.execute(pool).await;
-    matches!(r, Ok(r) if r.rows_affected() > 0)
+    if let Some(v) = &f.filename { q = q.bind(v); }
+    if let Some(v) = f.favorite  { q = q.bind(if v { 1i32 } else { 0i32 }); }
+    if let Some(v) = &f.tags     { q = q.bind(v.to_string()); }
+    if let Some(v) = &f.notes    { q = q.bind(v); }
+    if let Some(v) = &f.folder_id { q = q.bind(v.as_deref()); }
+    q = q.bind(now_rfc3339()).bind(id);
+    let r = q.execute(pool).await?;
+    Ok(r.rows_affected() > 0)
 }
 
-pub async fn find_by_checksum(pool: &SqlitePool, checksum: &str) -> Option<MediaRow> {
+pub async fn find_by_checksum(pool: &SqlitePool, checksum: &str) -> Result<Option<MediaRow>, sqlx::Error> {
     sqlx::query_as::<_, MediaRow>(&format!(
         "SELECT {ALL_COLS} FROM media WHERE checksum = ? AND deleted_at IS NULL"
-    )).bind(checksum).fetch_optional(pool).await.ok().flatten()
+    )).bind(checksum).fetch_optional(pool).await
 }
 
 pub async fn count_active(pool: &SqlitePool) -> i64 {
@@ -221,73 +270,185 @@ pub async fn total_size(pool: &SqlitePool) -> i64 {
         .fetch_one(pool).await.map(|r| r.0).unwrap_or(0)
 }
 
-// ── flexible query ──
+// ── folder CRUD ──
+
+pub async fn insert_folder(pool: &SqlitePool, r: &FolderRow) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO folders (id, name, parent_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)")
+        .bind(&r.id).bind(&r.name).bind(&r.parent_id).bind(&r.created_at).bind(&r.updated_at)
+        .execute(pool).await?;
+    Ok(())
+}
+
+pub async fn get_folder(pool: &SqlitePool, id: &str) -> Result<Option<FolderRow>, sqlx::Error> {
+    sqlx::query_as::<_, FolderRow>("SELECT id, name, parent_id, created_at, updated_at FROM folders WHERE id = ?")
+        .bind(id).fetch_optional(pool).await
+}
+
+/// 一条 SQL 拿到 folder + cover + count，消灭 N+1 (P1)
+#[derive(Debug, Clone, Serialize)]
+pub struct FolderWithMeta {
+    pub row: FolderRow,
+    pub cover_id: Option<String>,
+    pub cover_media_type: Option<String>,
+    pub item_count: i64,
+}
+
+pub async fn list_folders_with_meta(
+    pool: &SqlitePool,
+    parent_id: Option<&str>,
+) -> Result<Vec<FolderWithMeta>, sqlx::Error> {
+    let sql = "
+        SELECT
+            f.id, f.name, f.parent_id, f.created_at, f.updated_at,
+            (SELECT m.id FROM media m
+                WHERE m.folder_id = f.id AND m.deleted_at IS NULL AND m.has_thumb = 1
+                ORDER BY COALESCE(m.taken_at, m.created_at) DESC LIMIT 1) AS cover_id,
+            (SELECT m.media_type FROM media m
+                WHERE m.folder_id = f.id AND m.deleted_at IS NULL AND m.has_thumb = 1
+                ORDER BY COALESCE(m.taken_at, m.created_at) DESC LIMIT 1) AS cover_media_type,
+            (SELECT COUNT(*) FROM media m
+                WHERE m.folder_id = f.id AND m.deleted_at IS NULL) AS item_count
+        FROM folders f
+        WHERE ";
+    let where_clause = if parent_id.is_some() { "f.parent_id = ?" } else { "f.parent_id IS NULL" };
+    let order = " ORDER BY f.name ASC";
+    let full_sql = format!("{sql}{where_clause}{order}");
+
+    let mut q = sqlx::query(&full_sql);
+    if let Some(pid) = parent_id { q = q.bind(pid); }
+
+    let rows = q.fetch_all(pool).await?;
+    Ok(rows.into_iter().map(|row| FolderWithMeta {
+        row: FolderRow {
+            id: row.get("id"),
+            name: row.get("name"),
+            parent_id: row.get("parent_id"),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+        },
+        cover_id: row.get("cover_id"),
+        cover_media_type: row.get("cover_media_type"),
+        item_count: row.get("item_count"),
+    }).collect())
+}
+
+pub async fn rename_folder(pool: &SqlitePool, id: &str, name: &str) -> Result<bool, sqlx::Error> {
+    let now = now_rfc3339();
+    let r = sqlx::query("UPDATE folders SET name = ?, updated_at = ? WHERE id = ?")
+        .bind(name).bind(&now).bind(id).execute(pool).await?;
+    Ok(r.rows_affected() > 0)
+}
+
+pub async fn delete_folder(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query("DELETE FROM folders WHERE id = ?")
+        .bind(id).execute(pool).await?;
+    Ok(r.rows_affected() > 0)
+}
+
+pub async fn folder_has_children(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
+    let n: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM folders WHERE parent_id = ?")
+        .bind(id).fetch_one(pool).await?;
+    Ok(n.0 > 0)
+}
+
+pub async fn folder_has_media(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
+    let n: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM media WHERE folder_id = ? AND deleted_at IS NULL")
+        .bind(id).fetch_one(pool).await?;
+    Ok(n.0 > 0)
+}
+
+/// batch move (R3)
+pub async fn move_many(pool: &SqlitePool, ids: &[String], folder_id: Option<&str>) -> Result<u64, sqlx::Error> {
+    if ids.is_empty() { return Ok(0); }
+    let mut total = 0u64;
+    for chunk in ids.chunks(500) {
+        let placeholders = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+        let now = now_rfc3339();
+        let sql = format!(
+            "UPDATE media SET folder_id = ?, updated_at = ? WHERE id IN ({placeholders})"
+        );
+        let mut q = sqlx::query(&sql).bind(folder_id).bind(&now);
+        for id in chunk { q = q.bind(id); }
+        total += q.execute(pool).await?.rows_affected();
+    }
+    Ok(total)
+}
+
+/// 批量设置收藏（R: favorite 0/1）
+pub async fn set_favorite_many(pool: &SqlitePool, ids: &[String], favorite: bool) -> Result<u64, sqlx::Error> {
+    if ids.is_empty() { return Ok(0); }
+    let mut total = 0u64;
+    let fav: i32 = if favorite { 1 } else { 0 };
+    for chunk in ids.chunks(500) {
+        let placeholders = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+        let now = now_rfc3339();
+        let sql = format!(
+            "UPDATE media SET favorite = ?, updated_at = ? WHERE id IN ({placeholders})"
+        );
+        let mut q = sqlx::query(&sql).bind(fav).bind(&now);
+        for id in chunk { q = q.bind(id); }
+        total += q.execute(pool).await?.rows_affected();
+    }
+    Ok(total)
+}
+
+// ── flexible query with cursor pagination (R5) ──
 
 const ALLOWED_FIELDS: &[&str] = &[
     "id","filename","ext","mime","media_type","size","width","height","duration",
     "orientation","taken_at","created_at","updated_at","deleted_at","checksum",
     "exif_make","exif_model","exif_lens","exif_focal_length","exif_aperture",
     "exif_iso","exif_exposure","exif_gps_lat","exif_gps_lng",
-    "favorite","tags","notes","has_thumb",
+    "favorite","tags","notes","has_thumb","folder_id",
 ];
 
-fn is_allowed_field(f: &str) -> bool {
-    ALLOWED_FIELDS.contains(&f)
-}
+fn is_allowed_field(f: &str) -> bool { ALLOWED_FIELDS.contains(&f) }
 
 #[derive(Debug, Deserialize)]
 pub struct QueryRequest {
-    #[serde(default)]
-    pub filter: Option<FilterNode>,
-    #[serde(default)]
-    pub sort: Option<Vec<SortItem>>,
-    #[serde(default = "default_page")]
-    pub page: i64,
-    #[serde(default = "default_size")]
-    pub size: i64,
+    #[serde(default)] pub filter: Option<FilterNode>,
+    #[serde(default)] pub sort: Option<Vec<SortItem>>,
+    /// page 分页 (兼容)
+    #[serde(default)] pub page: Option<i64>,
+    #[serde(default)] pub size: Option<i64>,
+    /// cursor 分页 (推荐): base64(json({"v":<sort_value_or_null>,"id":"<id>"}))
+    #[serde(default)] pub cursor: Option<String>,
+    /// 是否需要 total（cursor 分页默认 false，减少一次 count 查询）
+    #[serde(default)] pub with_total: Option<bool>,
 }
-fn default_page() -> i64 { 1 }
-fn default_size() -> i64 { 50 }
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum FilterNode {
-    Group { #[serde(alias = "AND", alias = "and")] and: Option<Vec<FilterNode>>,
-            #[serde(alias = "OR", alias = "or")]   or: Option<Vec<FilterNode>> },
     Cond  { field: String, op: String, value: Option<serde_json::Value> },
+    Group { #[serde(alias = "AND", alias = "and")] and: Option<Vec<FilterNode>>,
+            #[serde(alias = "OR", alias = "or")]   or:  Option<Vec<FilterNode>> },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct SortItem {
     pub field: String,
-    #[serde(default = "default_dir")]
-    pub dir: String,
+    #[serde(default = "default_dir")] pub dir: String,
 }
 fn default_dir() -> String { "desc".into() }
 
 pub struct BuiltQuery {
     pub sql: String,
-    pub binds: Vec<String>,
+    pub binds: Vec<serde_json::Value>,
 }
 
 pub fn build_filter(node: &FilterNode) -> Result<BuiltQuery, String> {
     match node {
         FilterNode::Group { and, or } => {
-            if let Some(items) = and {
-                let parts: Result<Vec<BuiltQuery>, String> = items.iter().map(build_filter).collect();
-                let parts = parts?;
-                let sqls: Vec<String> = parts.iter().map(|p| p.sql.clone()).collect();
-                let binds: Vec<String> = parts.into_iter().flat_map(|p| p.binds).collect();
-                Ok(BuiltQuery { sql: format!("({})", sqls.join(" AND ")), binds })
-            } else if let Some(items) = or {
-                let parts: Result<Vec<BuiltQuery>, String> = items.iter().map(build_filter).collect();
-                let parts = parts?;
-                let sqls: Vec<String> = parts.iter().map(|p| p.sql.clone()).collect();
-                let binds: Vec<String> = parts.into_iter().flat_map(|p| p.binds).collect();
-                Ok(BuiltQuery { sql: format!("({})", sqls.join(" OR ")), binds })
-            } else {
-                Ok(BuiltQuery { sql: "1=1".into(), binds: vec![] })
-            }
+            let (items, joiner) = if let Some(items) = and { (items, " AND ") }
+                else if let Some(items) = or { (items, " OR ") }
+                else { return Ok(BuiltQuery { sql: "1=1".into(), binds: vec![] }); };
+
+            let parts: Result<Vec<_>, _> = items.iter().map(build_filter).collect();
+            let parts = parts?;
+            let sqls: Vec<String> = parts.iter().map(|p| p.sql.clone()).collect();
+            let binds: Vec<_> = parts.into_iter().flat_map(|p| p.binds).collect();
+            Ok(BuiltQuery { sql: format!("({})", sqls.join(joiner)), binds })
         }
         FilterNode::Cond { field, op, value } => {
             if !is_allowed_field(field) {
@@ -296,27 +457,26 @@ pub fn build_filter(node: &FilterNode) -> Result<BuiltQuery, String> {
             let op_lower = op.to_lowercase();
             match op_lower.as_str() {
                 "=" | "!=" | ">" | "<" | ">=" | "<=" => {
-                    let v = value.as_ref().map(json_to_string).unwrap_or_default();
+                    let v = value.clone().unwrap_or(serde_json::Value::Null);
                     Ok(BuiltQuery { sql: format!("{field} {op_lower} ?"), binds: vec![v] })
                 }
                 "like" => {
-                    let v = value.as_ref().map(json_to_string).unwrap_or_default();
+                    let v = value.clone().unwrap_or(serde_json::Value::Null);
                     Ok(BuiltQuery { sql: format!("{field} LIKE ?"), binds: vec![v] })
                 }
                 "in" => {
                     if let Some(serde_json::Value::Array(arr)) = value {
                         let placeholders: Vec<&str> = arr.iter().map(|_| "?").collect();
-                        let binds: Vec<String> = arr.iter().map(json_to_string).collect();
-                        Ok(BuiltQuery { sql: format!("{field} IN ({})", placeholders.join(",")), binds })
-                    } else {
-                        Err("'in' requires array value".into())
-                    }
+                        Ok(BuiltQuery {
+                            sql: format!("{field} IN ({})", placeholders.join(",")),
+                            binds: arr.clone(),
+                        })
+                    } else { Err("'in' requires array value".into()) }
                 }
                 "between" => {
                     if let Some(serde_json::Value::Array(arr)) = value {
                         if arr.len() == 2 {
-                            let binds = vec![json_to_string(&arr[0]), json_to_string(&arr[1])];
-                            Ok(BuiltQuery { sql: format!("{field} BETWEEN ? AND ?"), binds })
+                            Ok(BuiltQuery { sql: format!("{field} BETWEEN ? AND ?"), binds: vec![arr[0].clone(), arr[1].clone()] })
                         } else { Err("'between' requires [low, high]".into()) }
                     } else { Err("'between' requires array".into()) }
                 }
@@ -328,54 +488,181 @@ pub fn build_filter(node: &FilterNode) -> Result<BuiltQuery, String> {
     }
 }
 
-fn json_to_string(v: &serde_json::Value) -> String {
+fn bind_json<'a>(
+    q: sqlx::query::QueryAs<'a, sqlx::Sqlite, MediaRow, sqlx::sqlite::SqliteArguments<'a>>,
+    v: &'a serde_json::Value,
+) -> sqlx::query::QueryAs<'a, sqlx::Sqlite, MediaRow, sqlx::sqlite::SqliteArguments<'a>> {
     match v {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::Bool(b) => if *b { "1".into() } else { "0".into() },
-        serde_json::Value::Null => String::new(),
-        other => other.to_string(),
+        serde_json::Value::String(s) => q.bind(s.clone()),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() { q.bind(i) }
+            else if let Some(f) = n.as_f64() { q.bind(f) }
+            else { q.bind(n.to_string()) }
+        }
+        serde_json::Value::Bool(b) => q.bind(if *b { 1i32 } else { 0i32 }),
+        serde_json::Value::Null => q.bind(Option::<String>::None),
+        other => q.bind(other.to_string()),
     }
 }
 
-pub async fn query_media(pool: &SqlitePool, req: &QueryRequest) -> Result<(Vec<MediaRow>, i64), String> {
-    let page = req.page.max(1);
-    let size = req.size.clamp(1, 500);
-    let offset = (page - 1) * size;
+fn bind_json_count<'a>(
+    q: sqlx::query::QueryAs<'a, sqlx::Sqlite, (i64,), sqlx::sqlite::SqliteArguments<'a>>,
+    v: &'a serde_json::Value,
+) -> sqlx::query::QueryAs<'a, sqlx::Sqlite, (i64,), sqlx::sqlite::SqliteArguments<'a>> {
+    match v {
+        serde_json::Value::String(s) => q.bind(s.clone()),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() { q.bind(i) }
+            else if let Some(f) = n.as_f64() { q.bind(f) }
+            else { q.bind(n.to_string()) }
+        }
+        serde_json::Value::Bool(b) => q.bind(if *b { 1i32 } else { 0i32 }),
+        serde_json::Value::Null => q.bind(Option::<String>::None),
+        other => q.bind(other.to_string()),
+    }
+}
 
-    let where_sql = if let Some(ref filter) = req.filter {
-        let built = build_filter(filter)?;
-        (built.sql, built.binds)
-    } else {
-        ("1=1".into(), vec![])
+#[derive(Debug, Serialize)]
+pub struct QueryResult {
+    pub items: Vec<MediaRow>,
+    pub next_cursor: Option<String>,
+    pub total: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CursorPayload {
+    /// primary sort field value (as JSON) — null 表示排序值为 NULL
+    v: serde_json::Value,
+    /// tie-breaker id
+    id: String,
+}
+
+pub async fn query_media(pool: &SqlitePool, req: &QueryRequest) -> Result<QueryResult, String> {
+    let size = req.size.unwrap_or(50).clamp(1, 500);
+
+    // 排序：取首个合法字段作 primary；缺省用 COALESCE(taken_at, created_at) DESC
+    let sorts: Vec<SortItem> = req.sort
+        .clone()
+        .unwrap_or_else(|| vec![SortItem { field: "taken_at".into(), dir: "desc".into() }])
+        .into_iter()
+        .filter(|s| is_allowed_field(&s.field))
+        .collect();
+
+    let (primary_field, primary_dir) = sorts.first()
+        .map(|s| (s.field.clone(), if s.dir.to_lowercase() == "asc" { "ASC" } else { "DESC" }))
+        .unwrap_or(("taken_at".to_string(), "DESC"));
+
+    // where
+    let (mut where_sql, where_binds) = match &req.filter {
+        Some(f) => {
+            let built = build_filter(f).map_err(|e| e)?;
+            (built.sql, built.binds)
+        }
+        None => ("1=1".into(), vec![]),
     };
 
-    let order_sql = if let Some(ref sorts) = req.sort {
-        let parts: Vec<String> = sorts.iter().filter_map(|s| {
-            if !is_allowed_field(&s.field) { return None; }
+    // cursor: (primary_field, id) 之后
+    let mut cursor_binds: Vec<serde_json::Value> = Vec::new();
+    if let Some(cursor_str) = &req.cursor {
+        if let Some(payload) = decode_cursor(cursor_str) {
+            // 复合游标：(v, id) 大于/小于 (payload.v, payload.id)
+            // 处理 NULL LAST：DESC 时 NULL 排最后 → 游标推进时需要 (v IS NOT NULL AND (v < ? OR (v = ? AND id < ?))) OR (v IS NULL AND primary IS NULL AND id < ?)
+            // 简化：绝大多数场景 v 非 null；给 NULL 单独一分支
+            let cmp = if primary_dir == "ASC" { ">" } else { "<" };
+            let is_null_cursor = matches!(payload.v, serde_json::Value::Null);
+            if is_null_cursor {
+                // 已经在 NULL 段：只需 id 继续
+                where_sql = format!("({where_sql}) AND ({primary_field} IS NULL AND id {cmp} ?)");
+                cursor_binds.push(serde_json::Value::String(payload.id));
+            } else {
+                where_sql = format!(
+                    "({where_sql}) AND ((({primary_field} {cmp} ?) OR ({primary_field} = ? AND id {cmp} ?)) OR {primary_field} IS NULL)"
+                );
+                cursor_binds.push(payload.v.clone());
+                cursor_binds.push(payload.v);
+                cursor_binds.push(serde_json::Value::String(payload.id));
+            }
+        }
+    } else if let (Some(page), true) = (req.page, req.cursor.is_none()) {
+        // page 分页兼容路径
+        let page = page.max(1);
+        let offset = (page - 1) * size;
+        let order_parts: Vec<String> = sorts.iter().map(|s| {
             let dir = if s.dir.to_lowercase() == "asc" { "ASC" } else { "DESC" };
-            Some(format!("{} {} NULLS LAST", s.field, dir))
+            format!("{} {} NULLS LAST", s.field, dir)
         }).collect();
-        if parts.is_empty() { "COALESCE(taken_at, created_at) DESC".into() }
-        else { parts.join(", ") }
-    } else {
-        "COALESCE(taken_at, created_at) DESC".into()
-    };
+        let order_sql = if order_parts.is_empty() {
+            "COALESCE(taken_at, created_at) DESC".to_string()
+        } else {
+            format!("{}, id DESC", order_parts.join(", "))
+        };
 
-    let count_sql = format!("SELECT COUNT(*) FROM media WHERE {}", where_sql.0);
+        let count_sql = format!("SELECT COUNT(*) FROM media WHERE {where_sql}");
+        let data_sql = format!("SELECT {ALL_COLS} FROM media WHERE {where_sql} ORDER BY {order_sql} LIMIT ? OFFSET ?");
+
+        let mut cq = sqlx::query_as::<_, (i64,)>(&count_sql);
+        for v in &where_binds { cq = bind_json_count(cq, v); }
+        let total = cq.fetch_one(pool).await.map_err(|e| e.to_string())?.0;
+
+        let mut dq = sqlx::query_as::<_, MediaRow>(&data_sql);
+        for v in &where_binds { dq = bind_json(dq, v); }
+        dq = dq.bind(size).bind(offset);
+        let items = dq.fetch_all(pool).await.map_err(|e| e.to_string())?;
+
+        return Ok(QueryResult { items, next_cursor: None, total: Some(total) });
+    }
+
+    // cursor 分页
+    // ORDER BY 用 (primary NULLS LAST, id DESC) 保证稳定顺序
+    let order_sql = format!("{primary_field} {primary_dir} NULLS LAST, id DESC");
+
     let data_sql = format!(
-        "SELECT {ALL_COLS} FROM media WHERE {} ORDER BY {} LIMIT ? OFFSET ?",
-        where_sql.0, order_sql
+        "SELECT {ALL_COLS} FROM media WHERE {where_sql} ORDER BY {order_sql} LIMIT ?"
     );
 
-    let mut cq = sqlx::query_as::<_, (i64,)>(&count_sql);
-    for v in &where_sql.1 { cq = cq.bind(v); }
-    let total = cq.fetch_one(pool).await.map(|r| r.0).unwrap_or(0);
-
     let mut dq = sqlx::query_as::<_, MediaRow>(&data_sql);
-    for v in &where_sql.1 { dq = dq.bind(v); }
-    dq = dq.bind(size).bind(offset);
-    let rows = dq.fetch_all(pool).await.unwrap_or_default();
+    for v in &where_binds { dq = bind_json(dq, v); }
+    for v in &cursor_binds { dq = bind_json(dq, v); }
+    dq = dq.bind(size + 1); // 多取 1 判断 has_more
 
-    Ok((rows, total))
+    let mut items = dq.fetch_all(pool).await.map_err(|e| e.to_string())?;
+
+    let next_cursor = if items.len() > size as usize {
+        items.pop();
+        items.last().map(|last| encode_cursor(&CursorPayload {
+            v: extract_field_value(last, &primary_field),
+            id: last.id.clone(),
+        }))
+    } else {
+        None
+    };
+
+    let total = if req.with_total.unwrap_or(false) {
+        let count_sql = format!("SELECT COUNT(*) FROM media WHERE {where_sql}");
+        let mut cq = sqlx::query_as::<_, (i64,)>(&count_sql);
+        for v in &where_binds { cq = bind_json_count(cq, v); }
+        Some(cq.fetch_one(pool).await.map_err(|e| e.to_string())?.0)
+    } else {
+        None
+    };
+
+    Ok(QueryResult { items, next_cursor, total })
+}
+
+fn encode_cursor(p: &CursorPayload) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let json = serde_json::to_string(p).unwrap_or_default();
+    URL_SAFE_NO_PAD.encode(json.as_bytes())
+}
+
+fn decode_cursor(s: &str) -> Option<CursorPayload> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let bytes = URL_SAFE_NO_PAD.decode(s).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn extract_field_value(row: &MediaRow, field: &str) -> serde_json::Value {
+    // 通过 serde 转 JSON 再取字段
+    let v = serde_json::to_value(row).unwrap_or(serde_json::Value::Null);
+    v.get(field).cloned().unwrap_or(serde_json::Value::Null)
 }

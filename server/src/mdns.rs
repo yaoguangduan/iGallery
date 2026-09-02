@@ -3,9 +3,8 @@ use std::net::UdpSocket;
 
 const SERVICE_TYPE: &str = "_igallery._tcp.local.";
 
-pub fn register(port: u16, device_name: &str) {
-    let mdns = ServiceDaemon::new().expect("failed to create mDNS daemon");
-
+/// M7: 由 caller 持有 daemon（存 AppState），进程退出前 unregister
+pub fn register(mdns: &ServiceDaemon, port: u16, device_name: &str) {
     let hostname = gethostname::gethostname()
         .to_string_lossy()
         .to_string();
@@ -15,22 +14,27 @@ pub fn register(port: u16, device_name: &str) {
 
     let local_ip = local_ipv4().unwrap_or_else(|| "0.0.0.0".to_string());
 
-    let service = ServiceInfo::new(
+    let service = match ServiceInfo::new(
         SERVICE_TYPE,
         &instance_name,
         &format!("{hostname}.local."),
         &local_ip,
         port,
         &properties[..],
-    )
-    .expect("failed to create service info");
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("mDNS ServiceInfo failed: {e}");
+            return;
+        }
+    };
 
-    mdns.register(service)
-        .expect("failed to register mDNS service");
+    if let Err(e) = mdns.register(service) {
+        tracing::warn!("mDNS register failed: {e}");
+        return;
+    }
 
     tracing::info!("mDNS registered: {instance_name} at {local_ip}:{port}");
-
-    std::mem::forget(mdns);
 }
 
 fn local_ipv4() -> Option<String> {

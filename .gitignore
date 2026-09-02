@@ -1,0 +1,7 @@
+# Rust build output. 2.6GB and regenerated from source — without this rule a
+# single `git add -A` pulls the whole thing into history permanently.
+/server/target/
+
+# Runtime state, not source: the media index the server builds by scanning the
+# library, plus SQLite's sidecar files. Machine-specific and rebuilt on start.
+/server/data/

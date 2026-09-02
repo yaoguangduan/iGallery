@@ -16,13 +16,19 @@ pub struct ExifData {
     pub gps_lng: Option<f64>,
 }
 
+impl Default for ExifData {
+    fn default() -> Self {
+        Self {
+            taken_at: None, width: None, height: None, orientation: None,
+            make: None, model: None, lens: None, focal_length: None,
+            aperture: None, iso: None, exposure: None,
+            gps_lat: None, gps_lng: None,
+        }
+    }
+}
+
 pub fn extract(path: &Path) -> ExifData {
-    let mut data = ExifData {
-        taken_at: None, width: None, height: None, orientation: None,
-        make: None, model: None, lens: None, focal_length: None,
-        aperture: None, iso: None, exposure: None,
-        gps_lat: None, gps_lng: None,
-    };
+    let mut data = ExifData::default();
 
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
@@ -35,6 +41,7 @@ pub fn extract(path: &Path) -> ExifData {
     };
 
     data.taken_at = get_str(&exif, exif::Tag::DateTimeOriginal)
+        .or_else(|| get_str(&exif, exif::Tag::DateTime))
         .and_then(|s| parse_exif_datetime(&s));
 
     data.width = get_u32(&exif, exif::Tag::PixelXDimension)
@@ -105,10 +112,27 @@ fn extract_gps_coord(exif: &exif::Exif, tag: exif::Tag, ref_tag: exif::Tag) -> O
     Some(coord)
 }
 
+/// EXIF 常见 "2024:01:01 12:00:00"，也接受 ISO 8601。 (R6)
+/// 输出统一北京时间的 RFC 3339 字符串（EXIF 无时区信息，视为本地北京时间）。
 fn parse_exif_datetime(s: &str) -> Option<String> {
     let s = s.trim().trim_matches('"');
-    if s.len() < 19 { return None; }
-    let date_part = &s[..10];
-    let time_part = &s[11..19];
-    Some(format!("{}T{}", date_part.replace(':', "-"), time_part))
+
+    // 1. ISO 8601 直接过
+    if let Some(dt) = crate::time::parse_flexible(s) {
+        return Some(dt.with_timezone(&crate::time::beijing()).to_rfc3339());
+    }
+
+    // 2. EXIF 冒号格式
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, "%Y:%m:%d %H:%M:%S") {
+        use chrono::TimeZone;
+        let dt = crate::time::beijing().from_local_datetime(&ndt).single()?;
+        return Some(dt.to_rfc3339());
+    }
+    // 3. 有亚秒
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, "%Y:%m:%d %H:%M:%S%.f") {
+        use chrono::TimeZone;
+        let dt = crate::time::beijing().from_local_datetime(&ndt).single()?;
+        return Some(dt.to_rfc3339());
+    }
+    None
 }
