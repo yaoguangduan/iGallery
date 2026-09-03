@@ -47,6 +47,10 @@ pub async fn get_media(
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => { tracing::error!("get_media db: {e}"); return StatusCode::INTERNAL_SERVER_ERROR.into_response(); }
     };
+    // 已软删除的条目不再提供原文件（删除后到期会被物理清理）
+    if row.deleted_at.is_some() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let path = state.media_dir.join(format!("{}.{}", id, row.ext));
     if !path.exists() {
         return StatusCode::NOT_FOUND.into_response();
@@ -72,6 +76,12 @@ pub async fn get_thumb(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // 先查库：已软删除的不再给缩略图，否则删掉的图还会出现在别的客户端网格里
+    match db::get_media(&state.pool, &id).await {
+        Ok(Some(row)) if row.deleted_at.is_none() => {}
+        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => { tracing::error!("get_thumb db: {e}"); return StatusCode::INTERNAL_SERVER_ERROR.into_response(); }
+    }
     let path = state.thumbs_dir.join(format!("{id}.jpg"));
     match fs::read(&path).await {
         Ok(data) => (
@@ -111,19 +121,40 @@ struct UploadItem {
     dedup: bool,
 }
 
+#[derive(Serialize)]
+struct UploadResponse {
+    items: Vec<UploadItem>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    errors: Vec<UploadError>,
+}
+
+#[derive(Serialize)]
+struct UploadError {
+    filename: String,
+    error: String,
+}
+
 pub async fn upload(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
-    let mut taken_at_override: Option<String> = None;
+    // 注意：这几个字段必须排在 file 之前才生效。http 包的 MultipartRequest
+    // 会先写 fields 再写 files，客户端天然满足。
+    let mut taken_at_explicit: Option<String> = None;
+    let mut mtime_fallback: Option<String> = None;
     let mut folder_id_override: Option<String> = None;
     let mut uploaded: Vec<UploadItem> = Vec::new();
+    let mut errors: Vec<UploadError> = Vec::new();
 
     while let Ok(Some(field)) = multipart.next_field().await {
         let name = field.name().unwrap_or("").to_string();
 
         if name == "taken_at" {
-            if let Ok(text) = field.text().await { taken_at_override = Some(text); }
+            if let Ok(text) = field.text().await { taken_at_explicit = Some(text); }
+            continue;
+        }
+        if name == "file_mtime" {
+            if let Ok(text) = field.text().await { mtime_fallback = Some(text); }
             continue;
         }
         if name == "folder_id" {
@@ -135,13 +166,27 @@ pub async fn upload(
         let filename = field.file_name().unwrap_or("unknown").to_string();
         let content_type = field.content_type().unwrap_or("application/octet-stream").to_string();
 
-        match stream_upload(&state, field, &filename, &content_type, taken_at_override.as_deref(), folder_id_override.clone()).await {
+        match stream_upload(&state, field, &filename, &content_type,
+            taken_at_explicit.as_deref(), mtime_fallback.as_deref(),
+            folder_id_override.clone()).await {
             Ok(Some(item)) => uploaded.push(item),
             Ok(None) => {}
-            Err(e) => tracing::warn!("upload failed for {filename}: {e}"),
+            Err(e) => {
+                tracing::warn!("upload failed for {filename}: {e}");
+                errors.push(UploadError { filename: filename.clone(), error: e });
+            }
         }
     }
-    Json(uploaded).into_response()
+    // 一个文件都没成、也没记到错，说明 multipart 流在中途断了
+    // （客户端取消上传就是这个路径）。返回空 items 会被客户端当成"上传成功 0 个"，
+    // 必须显式给个错误，让它记进上传历史。
+    if uploaded.is_empty() && errors.is_empty() {
+        errors.push(UploadError {
+            filename: String::new(),
+            error: "上传中断，未收到完整文件".to_string(),
+        });
+    }
+    Json(UploadResponse { items: uploaded, errors }).into_response()
 }
 
 pub async fn upload_batch(
@@ -149,25 +194,63 @@ pub async fn upload_batch(
     mut multipart: Multipart,
 ) -> impl IntoResponse {
     let mut uploaded: Vec<UploadItem> = Vec::new();
-    while let Ok(Some(field)) = multipart.next_field().await {
-        let name = field.name().unwrap_or("").to_string();
-        if name != "file" { continue; }
-        let filename = field.file_name().unwrap_or("unknown").to_string();
-        let content_type = field.content_type().unwrap_or("application/octet-stream").to_string();
-        if let Ok(Some(item)) = stream_upload(&state, field, &filename, &content_type, None, None).await {
-            uploaded.push(item);
+    let mut errors: Vec<UploadError> = Vec::new();
+    loop {
+        match multipart.next_field().await {
+            Ok(Some(field)) => {
+                let name = field.name().unwrap_or("").to_string();
+                if name != "file" { continue; }
+                let filename = field.file_name().unwrap_or("unknown").to_string();
+                let content_type = field.content_type().unwrap_or("application/octet-stream").to_string();
+                match stream_upload(&state, field, &filename, &content_type, None, None, None).await {
+                    Ok(Some(item)) => uploaded.push(item),
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!("upload_batch failed for {filename}: {e}");
+                        errors.push(UploadError { filename, error: e });
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                // multipart 流本身坏了：后面的 field 也没法读，如实告诉客户端
+                tracing::warn!("upload_batch multipart: {e}");
+                errors.push(UploadError { filename: String::new(), error: format!("multipart: {e}") });
+                break;
+            }
         }
     }
-    Json(uploaded).into_response()
+    Json(UploadResponse { items: uploaded, errors }).into_response()
+}
+
+/// 客户端传来的时间戳统一归一成北京时间 RFC3339。
+/// 解析不了就当没传 —— 宁可留空让后面的兜底接手，也不要把脏字符串写进库：
+/// cursor 分页是按 taken_at 的**字符串**排序的，格式不一致会让翻页乱序。
+fn normalize_ts(raw: Option<&str>) -> Option<String> {
+    let s = raw?.trim();
+    if s.is_empty() { return None; }
+    crate::time::parse_flexible(s)
+        .map(|dt| dt.with_timezone(&crate::time::beijing()).to_rfc3339())
 }
 
 /// R2: 上传中断 → 清理临时文件；只有完整成功才写库。
+///
+/// 拍摄时间优先级（高 → 低）：
+///   1. `taken_at`   客户端从系统相册库读到的权威拍摄时间（移动端必填）
+///   2. EXIF         DateTimeOriginal / DateTime
+///   3. QuickTime    视频的 creation_time
+///   4. `file_mtime` 客户端文件修改时间，最弱的兜底
+///
+/// 1 必须压过 2：移动端交上来的是相册导出的副本，iOS 重新编码时可能把
+/// DateTime 写成导出时刻，那样 EXIF 反而是错的；而系统相册库里的
+/// createDateTime 一定是真实拍摄时间。
 async fn stream_upload(
     state: &AppState,
     mut field: axum::extract::multipart::Field<'_>,
     filename: &str,
     content_type: &str,
-    taken_at_override: Option<&str>,
+    taken_at_explicit: Option<&str>,
+    mtime_fallback: Option<&str>,
     folder_id: Option<String>,
 ) -> Result<Option<UploadItem>, String> {
     let id = Uuid::new_v4().to_string();
@@ -175,6 +258,10 @@ async fn stream_upload(
     let raw_ext = safe_filename.rsplit('.').next().unwrap_or("bin");
     let ext = sanitize_ext(raw_ext);
     let media_path = state.media_dir.join(format!("{id}.{ext}"));
+
+    if let Some(parent) = media_path.parent() {
+        fs::create_dir_all(parent).await.map_err(|e| format!("mkdir: {e}"))?;
+    }
 
     let mut file = fs::File::create(&media_path).await
         .map_err(|e| format!("create: {e}"))?;
@@ -224,7 +311,9 @@ async fn stream_upload(
         else { "other" };
 
     let exif = exif_util::extract(&media_path);
-    let mut taken_at = exif.taken_at.clone().or_else(|| taken_at_override.map(String::from));
+    // 1. 客户端权威值 → 2. EXIF（3/4 见下）
+    let mut taken_at = normalize_ts(taken_at_explicit)
+        .or_else(|| exif.taken_at.clone());
 
     let mut w: Option<i32> = None;
     let mut h: Option<i32> = None;
@@ -253,9 +342,12 @@ async fn stream_upload(
         w = meta.width.map(|v| v as i32);
         h = meta.height.map(|v| v as i32);
         has_thumb = meta.thumb_ok;
-        // 视频 QuickTime creation_time (备用时间源)
+        // 3. 视频 QuickTime creation_time
         if taken_at.is_none() { taken_at = meta.taken_at; }
     }
+
+    // 4. 最弱兜底：客户端文件修改时间
+    if taken_at.is_none() { taken_at = normalize_ts(mtime_fallback); }
 
     finalize_row(state, id, safe_filename, ext, content_type, media_type,
         total_size, w, h, duration, exif.orientation.map(|v| v as i32),
@@ -408,7 +500,9 @@ pub async fn download_batch(
     let mut files = Vec::new();
     for id in &body.ids {
         match db::get_media(&state.pool, id).await {
-            Ok(Some(row)) => files.push((format!("{id}.{}", row.ext), row.filename)),
+            Ok(Some(row)) if row.deleted_at.is_none() => {
+                files.push((format!("{id}.{}", row.ext), row.filename))
+            }
             _ => {}
         }
     }
@@ -431,7 +525,7 @@ pub async fn download_single(
     request: Request,
 ) -> impl IntoResponse {
     let row = match db::get_media(&state.pool, &id).await {
-        Ok(Some(r)) => r,
+        Ok(Some(r)) if r.deleted_at.is_none() => r,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
     let path = state.media_dir.join(format!("{}.{}", id, row.ext));

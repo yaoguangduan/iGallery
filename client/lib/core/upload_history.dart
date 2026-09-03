@@ -2,20 +2,22 @@ import 'package:sqflite/sqflite.dart';
 
 import 'kv_store.dart';
 
-enum UploadStatus { pending, success, dedup, failed }
+enum UploadStatus { pending, success, dedup, failed, cancelled }
 
 String _statusStr(UploadStatus s) => switch (s) {
-  UploadStatus.pending => 'pending',
-  UploadStatus.success => 'success',
-  UploadStatus.dedup   => 'dedup',
-  UploadStatus.failed  => 'failed',
+  UploadStatus.pending   => 'pending',
+  UploadStatus.success   => 'success',
+  UploadStatus.dedup     => 'dedup',
+  UploadStatus.failed    => 'failed',
+  UploadStatus.cancelled => 'cancelled',
 };
 
 UploadStatus _parseStatus(String s) => switch (s) {
-  'success' => UploadStatus.success,
-  'dedup'   => UploadStatus.dedup,
-  'failed'  => UploadStatus.failed,
-  _         => UploadStatus.pending,
+  'success'   => UploadStatus.success,
+  'dedup'     => UploadStatus.dedup,
+  'failed'    => UploadStatus.failed,
+  'cancelled' => UploadStatus.cancelled,
+  _           => UploadStatus.pending,
 };
 
 class UploadHistoryItem {
@@ -80,6 +82,24 @@ class UploadHistory {
       offset: offset,
     );
     return rows.map(_fromRow).toList();
+  }
+
+  /// 把上次进程遗留的 pending 标成中断。
+  ///
+  /// app 被杀 / 崩溃时正在传的那批会永远停在"进行中"，
+  /// 用户下次进来看到一堆假的进行中记录，不知道到底传没传成。
+  /// 启动时调一次即可：真正在传的项目此刻还没写进表。
+  static Future<void> markStalePending() async {
+    await KvStore.instance.db.update(
+      'upload_history',
+      {
+        'status': _statusStr(UploadStatus.failed),
+        'error': '上传中断（应用退出）',
+        'finished_at': DateTime.now().millisecondsSinceEpoch,
+      },
+      where: 'status = ?',
+      whereArgs: [_statusStr(UploadStatus.pending)],
+    );
   }
 
   static Future<void> clear() async {

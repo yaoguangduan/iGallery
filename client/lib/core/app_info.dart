@@ -6,5 +6,5 @@
 /// when that line was written. Do not hand-edit.
 abstract class AppInfo {
   static const String appName = 'iGallery';
-  static const String version = '0.1.4';
+  static const String version = '0.1.9';
 }

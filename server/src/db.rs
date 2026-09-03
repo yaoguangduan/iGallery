@@ -392,6 +392,37 @@ pub async fn set_favorite_many(pool: &SqlitePool, ids: &[String], favorite: bool
     Ok(total)
 }
 
+// ── 软删除物理清理（回收站到期）──
+
+/// 找出删除时间早于 `before` 的条目 (id, ext)，供 purge_loop 删文件用
+pub async fn select_purgeable(
+    pool: &SqlitePool,
+    before: &str,
+    limit: i64,
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    sqlx::query_as::<_, (String, String)>(
+        "SELECT id, ext FROM media WHERE deleted_at IS NOT NULL AND deleted_at < ? ORDER BY deleted_at ASC LIMIT ?",
+    )
+    .bind(before)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// 物理删除到期条目（只删仍处于已删除状态的，避免误删刚 restore 的）
+pub async fn purge_ids(pool: &SqlitePool, rows: &[(String, String)]) -> Result<u64, sqlx::Error> {
+    if rows.is_empty() { return Ok(0); }
+    let mut total = 0u64;
+    for chunk in rows.chunks(500) {
+        let placeholders = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+        let sql = format!("DELETE FROM media WHERE deleted_at IS NOT NULL AND id IN ({placeholders})");
+        let mut q = sqlx::query(&sql);
+        for (id, _) in chunk { q = q.bind(id); }
+        total += q.execute(pool).await?.rows_affected();
+    }
+    Ok(total)
+}
+
 // ── flexible query with cursor pagination (R5) ──
 
 const ALLOWED_FIELDS: &[&str] = &[
@@ -564,24 +595,26 @@ pub async fn query_media(pool: &SqlitePool, req: &QueryRequest) -> Result<QueryR
     // cursor: (primary_field, id) 之后
     let mut cursor_binds: Vec<serde_json::Value> = Vec::new();
     if let Some(cursor_str) = &req.cursor {
-        if let Some(payload) = decode_cursor(cursor_str) {
-            // 复合游标：(v, id) 大于/小于 (payload.v, payload.id)
-            // 处理 NULL LAST：DESC 时 NULL 排最后 → 游标推进时需要 (v IS NOT NULL AND (v < ? OR (v = ? AND id < ?))) OR (v IS NULL AND primary IS NULL AND id < ?)
-            // 简化：绝大多数场景 v 非 null；给 NULL 单独一分支
-            let cmp = if primary_dir == "ASC" { ">" } else { "<" };
-            let is_null_cursor = matches!(payload.v, serde_json::Value::Null);
-            if is_null_cursor {
-                // 已经在 NULL 段：只需 id 继续
-                where_sql = format!("({where_sql}) AND ({primary_field} IS NULL AND id {cmp} ?)");
-                cursor_binds.push(serde_json::Value::String(payload.id));
-            } else {
-                where_sql = format!(
-                    "({where_sql}) AND ((({primary_field} {cmp} ?) OR ({primary_field} = ? AND id {cmp} ?)) OR {primary_field} IS NULL)"
-                );
-                cursor_binds.push(payload.v.clone());
-                cursor_binds.push(payload.v);
-                cursor_binds.push(serde_json::Value::String(payload.id));
-            }
+        // 坏游标直接报错，不要静默从第一页重来 —— 那样"加载更多"会出现重复内容，
+        // 用户看不出问题在哪。客户端收到 400 后重置游标重新拉。
+        let payload = decode_cursor(cursor_str)
+            .ok_or_else(|| "invalid cursor".to_string())?;
+        // 复合游标：(v, id) 大于/小于 (payload.v, payload.id)
+        // 处理 NULL LAST：DESC 时 NULL 排最后 → 游标推进时需要 (v IS NOT NULL AND (v < ? OR (v = ? AND id < ?))) OR (v IS NULL AND primary IS NULL AND id < ?)
+        // 简化：绝大多数场景 v 非 null；给 NULL 单独一分支
+        let cmp = if primary_dir == "ASC" { ">" } else { "<" };
+        let is_null_cursor = matches!(payload.v, serde_json::Value::Null);
+        if is_null_cursor {
+            // 已经在 NULL 段：只需 id 继续
+            where_sql = format!("({where_sql}) AND ({primary_field} IS NULL AND id {cmp} ?)");
+            cursor_binds.push(serde_json::Value::String(payload.id));
+        } else {
+            where_sql = format!(
+                "({where_sql}) AND ((({primary_field} {cmp} ?) OR ({primary_field} = ? AND id {cmp} ?)) OR {primary_field} IS NULL)"
+            );
+            cursor_binds.push(payload.v.clone());
+            cursor_binds.push(payload.v);
+            cursor_binds.push(serde_json::Value::String(payload.id));
         }
     } else if let (Some(page), true) = (req.page, req.cursor.is_none()) {
         // page 分页兼容路径
@@ -638,9 +671,12 @@ pub async fn query_media(pool: &SqlitePool, req: &QueryRequest) -> Result<QueryR
     };
 
     let total = if req.with_total.unwrap_or(false) {
+        // where_sql 里可能已经拼进了 cursor 占位符，两组 bind 都要给，
+        // 否则 SQLite 报参数数量不匹配（cursor + with_total 组合直接 400）
         let count_sql = format!("SELECT COUNT(*) FROM media WHERE {where_sql}");
         let mut cq = sqlx::query_as::<_, (i64,)>(&count_sql);
         for v in &where_binds { cq = bind_json_count(cq, v); }
+        for v in &cursor_binds { cq = bind_json_count(cq, v); }
         Some(cq.fetch_one(pool).await.map_err(|e| e.to_string())?.0)
     } else {
         None

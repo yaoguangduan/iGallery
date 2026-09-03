@@ -98,7 +98,7 @@ class _ProfileContentState extends State<ProfileContent> {
                   if (s == state.active) {
                     state.disconnect();
                   } else {
-                    state.connect(s);
+                    _connectWithFeedback(context, state, s);
                   }
                 },
               ),
@@ -120,17 +120,18 @@ class _ProfileContentState extends State<ProfileContent> {
           ]),
         ],
 
-        // 局域网发现
-        if (state.discovered.where((s) => !state.servers.contains(s)).isNotEmpty) ...[
+        // 局域网发现。去重按名称（findKnown）：已经保存/连过的同一台，
+        // 就算 IP 变了也不在这儿重复出现。
+        if (state.discovered.where((s) => state.findKnown(s) == null).isNotEmpty) ...[
           const SectionHeader(title: '局域网发现'),
           SettingsGroup(children: [
             for (final s in state.discovered)
-              if (!state.servers.contains(s))
+              if (state.findKnown(s) == null)
                 SettingsTile(
                   icon: Icons.wifi_tethering,
                   label: s.name,
                   value: s.displayAddr,
-                  onTap: () => state.connect(s),
+                  onTap: () => _connectWithFeedback(context, state, s),
                 ),
           ]),
         ],
@@ -170,33 +171,64 @@ class _ProfileContentState extends State<ProfileContent> {
             filled: true, fillColor: c.surface2,
             border: OutlineInputBorder(borderRadius: BorderRadius.circular(AppRadius.chip), borderSide: BorderSide.none),
           ),
-          onSubmitted: (text) { _addServer(text, state); Navigator.pop(ctx); },
+          onSubmitted: (text) { Navigator.pop(ctx); _addServer(context, text, state); },
         ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx),
               child: Text('取消', style: TextStyle(color: c.onSurfaceVariant))),
-          TextButton(onPressed: () { _addServer(ctrl.text, state); Navigator.pop(ctx); },
+          TextButton(onPressed: () { Navigator.pop(ctx); _addServer(context, ctrl.text, state); },
               child: Text('添加', style: TextStyle(color: c.brand, fontWeight: FontWeight.w600))),
         ],
       );
     });
   }
 
-  void _addServer(String text, ServerState state) {
+  void _addServer(BuildContext context, String text, ServerState state) {
     text = text.trim();
-    if (text.isEmpty) return;
+    if (text.isEmpty) {
+      showToast(context, '请输入地址，如 192.168.1.100:9600', kind: ToastKind.info);
+      return;
+    }
     String host = text;
     int port = 9600;
     if (text.contains(':')) {
       final parts = text.split(':');
       host = parts[0];
-      port = int.tryParse(parts[1]) ?? 9600;
+      final parsed = int.tryParse(parts[1]);
+      if (parsed == null || parsed < 1 || parsed > 65535) {
+        showToast(context, '端口无效（1-65535）', kind: ToastKind.error);
+        return;
+      }
+      port = parsed;
+    }
+    if (host.isEmpty) {
+      showToast(context, '请输入主机地址', kind: ToastKind.error);
+      return;
     }
     final info = ServerInfo(name: host, host: host, port: port);
-    state.connect(info);
+    _connectWithFeedback(context, state, info);
+  }
+
+  /// 连接并给用户明确反馈。旧实现 connect() 后什么都不提示，
+  /// 连不上就只有个红点，用户不知道发生了什么。
+  Future<void> _connectWithFeedback(BuildContext context, ServerState state, ServerInfo info) async {
+    final result = await state.connect(info);
+    if (!context.mounted) return;
+    switch (result) {
+      case ConnectResult.connected:
+        showToast(context, '已连接 ${info.name}', kind: ToastKind.success);
+      case ConnectResult.needAuth:
+        showToast(context, '${info.name} 需要访问令牌', kind: ToastKind.info);
+      case ConnectResult.unreachable:
+        showToast(context, '无法连接 ${info.displayAddr}', kind: ToastKind.error);
+      case ConnectResult.superseded:
+        break; // 用户已经切到别的服务器，这次的结果作废
+    }
   }
 
   Color _serverColor(AppColors c, ServerState state, ServerInfo s) {
+    // 连接中先显示中性色：此时还没到判"失败"的时候，直接标红会让人误以为坏了
+    if (state.isConnecting(s)) return c.onMuted;
     if (state.needsAuth(s)) return c.warn;
     if (state.isReachable(s)) return c.ok;
     return c.error;
@@ -204,7 +236,9 @@ class _ProfileContentState extends State<ProfileContent> {
 
   Future<void> _promptToken(BuildContext context, ServerState state, ServerInfo info) async {
     final c = context.colors;
-    final existing = await AuthStore.get(info.host, info.port);
+    // 换了 IP 也能认出现有 token，别每次都让用户重输
+    final existing = await AuthStore.getForServer(
+        host: info.host, port: info.port, name: info.name);
     if (!context.mounted) return;
     final ctrl = TextEditingController(text: existing ?? '');
     final token = await showDialog<String>(
@@ -326,13 +360,6 @@ class DisplaySettingsContent extends StatelessWidget {
           SettingsTile(icon: Icons.animation, label: '过渡动画', value: _transLabel(prefs.viewerTransition),
               onTap: () => _pickTransition(context, prefs)),
         ]),
-        const SectionHeader(title: '裁剪'),
-        SettingsGroup(children: [
-          SettingsTile(icon: Icons.save_alt, label: '保存方式', value: _cropSaveLabel(prefs.cropSaveMode),
-              onTap: () => _pickCropSave(context, prefs)),
-          SettingsTile(icon: Icons.access_time, label: '裁剪后时间', value: _cropTimeLabel(prefs.cropTimeMode),
-              onTap: () => _pickCropTime(context, prefs)),
-        ]),
       ],
     );
   }
@@ -354,14 +381,6 @@ class DisplaySettingsContent extends StatelessWidget {
     (ViewerTransition.fade, '淡入淡出'), (ViewerTransition.scale, '缩放'),
     (ViewerTransition.none, '无动画'),
   ], p.viewerTransition, (v) => p.setViewerTransition(v));
-
-  void _pickCropSave(BuildContext ctx, DisplayPrefs p) => _showOptions(ctx, [
-    (CropSaveMode.ask, '每次询问'), (CropSaveMode.overwrite, '覆盖原图'), (CropSaveMode.saveAsNew, '另存为新图'),
-  ], p.cropSaveMode, (v) => p.setCropSaveMode(v));
-
-  void _pickCropTime(BuildContext ctx, DisplayPrefs p) => _showOptions(ctx, [
-    (CropTimeMode.keepOriginal, '保持原始拍摄时间'), (CropTimeMode.useCurrentTime, '使用当前时间'),
-  ], p.cropTimeMode, (v) => p.setCropTimeMode(v));
 
   void _pickSizeFilter(BuildContext ctx, DisplayPrefs p) => _showOptions<int?>(ctx, [
     (null, '不限'), (1024 * 100, '> 100 KB'), (1024 * 1024, '> 1 MB'),
@@ -435,8 +454,6 @@ class DisplaySettingsContent extends StatelessWidget {
   String _posLabel(LabelPosition p) => switch (p) { LabelPosition.below => '图片下方', LabelPosition.overlay => '图片内部', LabelPosition.none => '不显示' };
   String _densityLabel(GridDensity d) => switch (d) { GridDensity.small => '小', GridDensity.medium => '中', GridDensity.large => '大' };
   String _transLabel(ViewerTransition t) => switch (t) { ViewerTransition.fade => '淡入淡出', ViewerTransition.scale => '缩放', ViewerTransition.none => '无动画' };
-  String _cropSaveLabel(CropSaveMode m) => switch (m) { CropSaveMode.ask => '每次询问', CropSaveMode.overwrite => '覆盖原图', CropSaveMode.saveAsNew => '另存为新图' };
-  String _cropTimeLabel(CropTimeMode m) => switch (m) { CropTimeMode.keepOriginal => '保持原始时间', CropTimeMode.useCurrentTime => '使用当前时间' };
   String _sizeFilterLabel(DisplayPrefs p) { if (p.minSize == null) return '不限'; if (p.minSize! >= 1024 * 1024) return '> ${p.minSize! ~/ (1024 * 1024)} MB'; return '> ${p.minSize! ~/ 1024} KB'; }
   String _dateFilterLabel(DisplayPrefs p) { if (p.dateFrom == null || p.dateTo == null) return '不限'; final f = DateFormat('MM/dd'); return '${f.format(p.dateFrom!)} - ${f.format(p.dateTo!)}'; }
 }

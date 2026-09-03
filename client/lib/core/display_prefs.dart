@@ -8,8 +8,6 @@ enum MediaFilter { all, photosOnly, videosOnly, favoritesOnly }
 enum GroupMode { day, month, year, none }
 enum GridDensity { small, medium, large } // kept for settings migration
 enum ViewerTransition { fade, scale, none }
-enum CropSaveMode { ask, overwrite, saveAsNew }
-enum CropTimeMode { keepOriginal, useCurrentTime }
 
 class DisplayPrefs extends ChangeNotifier {
   bool _showName = true;
@@ -29,8 +27,6 @@ class DisplayPrefs extends ChangeNotifier {
   GridDensity _gridDensity = GridDensity.medium;
   int _gridColumns = 4;
   ViewerTransition _viewerTransition = ViewerTransition.fade;
-  CropSaveMode _cropSaveMode = CropSaveMode.ask;
-  CropTimeMode _cropTimeMode = CropTimeMode.keepOriginal;
 
   // getters
   bool get showName => _showName;
@@ -53,38 +49,12 @@ class DisplayPrefs extends ChangeNotifier {
   GridDensity get gridDensity => _gridDensity;
   int get gridColumns => _gridColumns;
   ViewerTransition get viewerTransition => _viewerTransition;
-  CropSaveMode get cropSaveMode => _cropSaveMode;
-  CropTimeMode get cropTimeMode => _cropTimeMode;
 
   double get thumbMaxExtent => switch (_gridDensity) {
         GridDensity.small => 90,
         GridDensity.medium => 130,
         GridDensity.large => 200,
       };
-
-  void pinchZoom(double scaleDirection) {
-    if (scaleDirection < 1.0) {
-      setGridColumns((_gridColumns + 1).clamp(1, 6));
-    } else if (scaleDirection > 1.0) {
-      setGridColumns((_gridColumns - 1).clamp(1, 6));
-    }
-  }
-
-  // P7: pinch 过程中只改内存 + notify，不落盘；结束时才 flush 一次
-  int? _pinchDirtyCol;
-  void pinchZoomTransient(double scaleDirection) {
-    final base = _pinchDirtyCol ?? _gridColumns;
-    final next = scaleDirection < 1.0 ? base + 1 : base - 1;
-    _pinchDirtyCol = next.clamp(1, 6);
-    _gridColumns = _pinchDirtyCol!;
-    notifyListeners();
-  }
-
-  void pinchZoomCommit() {
-    if (_pinchDirtyCol == null) return;
-    _save('gridColumns', '$_gridColumns');
-    _pinchDirtyCol = null;
-  }
 
   bool get hasActiveFilter =>
       _mediaFilter != MediaFilter.all ||
@@ -112,8 +82,6 @@ class DisplayPrefs extends ChangeNotifier {
     _gridDensity = _enumFromStr(GridDensity.values, kv['gridDensity']) ?? GridDensity.medium;
     _gridColumns = int.tryParse(kv['gridColumns'] ?? '') ?? 4;
     _viewerTransition = _enumFromStr(ViewerTransition.values, kv['viewerTransition']) ?? ViewerTransition.fade;
-    _cropSaveMode = _enumFromStr(CropSaveMode.values, kv['cropSaveMode']) ?? CropSaveMode.ask;
-    _cropTimeMode = _enumFromStr(CropTimeMode.values, kv['cropTimeMode']) ?? CropTimeMode.keepOriginal;
     notifyListeners();
   }
 
@@ -147,8 +115,6 @@ class DisplayPrefs extends ChangeNotifier {
   void setGridDensity(GridDensity v) { _gridDensity = v; _save('gridDensity', v.name); notifyListeners(); }
   void setGridColumns(int v) { _gridColumns = v.clamp(1, 6); _save('gridColumns', '$_gridColumns'); notifyListeners(); }
   void setViewerTransition(ViewerTransition v) { _viewerTransition = v; _save('viewerTransition', v.name); notifyListeners(); }
-  void setCropSaveMode(CropSaveMode v) { _cropSaveMode = v; _save('cropSaveMode', v.name); notifyListeners(); }
-  void setCropTimeMode(CropTimeMode v) { _cropTimeMode = v; _save('cropTimeMode', v.name); notifyListeners(); }
 
   void toggleSortOrder() {
     _sortOrder = _sortOrder == SortOrder.desc ? SortOrder.asc : SortOrder.desc;

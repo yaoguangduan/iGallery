@@ -28,6 +28,7 @@ client/lib/
 │   ├── disk_cache.dart       缩略图/小视频磁盘缓存 (LRU + TTL)
 │   ├── discovery_service.dart mDNS + 生命周期 + 网络切换重启
 │   ├── display_prefs.dart    显示偏好 (ChangeNotifier)
+│   ├── log_service.dart      客户端错误日志持久化 + 后台上传服务端
 │   ├── kv_store.dart         SQLite KV + 上传历史表
 │   ├── media_service.dart    服务端 API 封装
 │   ├── mime.dart             mime 猜测 (双端一致)
@@ -45,7 +46,9 @@ client/lib/
     │   ├── common.dart         设置行 / 分组
     │   ├── gallery_view.dart   相册主 State
     │   ├── gallery_groups.dart 分组算法 (纯函数)
+    │   ├── drag_select.dart    按住拖动连续多选 (相册网格 + 选择器共用)
     │   ├── gallery_widgets.dart MediaThumb / FolderThumb / FolderPickerDialog
+    │   ├── media_picker.dart   微信风格图片选择器 (photo_manager)
     │   ├── media_viewer.dart   全屏查看器
     │   └── settings_sheet.dart 设置面板
     ├── mobile/       移动壳（仅布局包装）
@@ -115,7 +118,8 @@ server/src/
 - 禁止随手写 `EdgeInsets.fromLTRB(18,16,...)`。1-3px 光学微调允许，其余就近归档。
 
 ### 2.4 字号与字重
-- 走 `AppType.*`。核心档：`xl`(20 页标题) / `mdPlus`(16 标题) / `base`(15 正文) / `sm`(13.5 次级) / `xs`(11.5 标签)。
+- 走 `AppType.*`。核心档：`xl`(24 页标题) / `mdPlus`(19 标题) / `base`(16 正文) / `sm`(15 次级) / `xs`(13 标签) / `xxs`(11.5 徽章)。
+  这一档整体偏大是**故意的**（对齐 YouTube 移动端），调小会立刻回到"扁平紧凑"的观感。
 - 不内嵌字体。中文走 `familyFallback`：PingFang SC → MiSans → HarmonyOS Sans SC → Source Han Sans SC → Noto Sans SC → Microsoft YaHei。
 - **字重三档**：`w700` 页标题 / `w600` 按钮+激活态 / `w500` 正文。禁止 w400。
 
@@ -124,14 +128,26 @@ server/src/
 - 分割线只用 `AppDivider`（0.5px `outline`）。
 - 图标尺寸只用 `AppIconSize`：`sm(16)` / `md(18)` / `lg(20)` / `xl(22)` / `hero(32)`。
 - 移动端可点击目标 ≥ 40×40。
-- 顶栏 52px + 底部 0.5px hairline。
+- 顶栏 58px + 底部 0.5px hairline。
 
 ### 2.6 网格（YouTube 卡片式）
+
+YouTube 的"简约但大气"来自**留白和字号**，不是把东西塞紧。
+下面这组数比 Material 默认偏大，**不要为了一屏多塞一行往回调**。
+
 - 缩略图圆角 `card`(12)，**留白优先于密度**。
-- 网格 padding 水平 12，间距 `mainAxisSpacing: 12` / `crossAxisSpacing: 10`。
-- 文件夹网格 `maxCrossAxisExtent: 130`，`childAspectRatio: 0.86`。
-- 分组标题：`mdPlus`(16) + `w700` + `onSurface`（不是灰色小字）。
+- **缩略图区恒为正方形**（`AspectRatio(1)`，服务端 `resize_to_fill` 出的就是
+  300×300）。不要用 `Expanded` —— 那样图片高度 = 格子高度减标签占用，
+  开了标签就变竖长方形，横图被裁成中间一条，和手机图库不一样。
+  格子的 `childAspectRatio` 要留出标签行：有标签 0.78，无标签 1.0。
+- 网格 padding 水平 16，间距 `mainAxisSpacing: 16` / `crossAxisSpacing: 14`。
+- 文件夹网格 `maxCrossAxisExtent: 150`，`childAspectRatio: 0.84`。
+- 分组标题：`mdPlus`(19) + `w700` + `letterSpacing: -0.3` + `onSurface`
+  （不是灰色小字），上下留白 28/12。
 - 缩略图下方 label：文件名 `xs` + `w500`，其余 `xxs` + `onSurfaceVariant`。
+- **格子窄于 96px 就不画 label**（`MediaThumb._labelMinTileWidth`）：
+  字号调大后 3~5 行元信息会把密集网格里的 `Expanded` 挤成 0 高，缩略图直接消失。
+  同时视频播放圆圈和角标缩一档、时长徽章隐藏。YouTube 密集布局下也是只留图。
 
 ### 2.7 通知
 - 统一用 `showToast(context, msg, kind: ToastKind.xxx)`，显示在屏幕顶部。
@@ -145,17 +161,116 @@ server/src/
 
 ### 3.1 导航结构
 - 无底部导航、无侧边栏。单页全屏相册，顶部工具栏。
-- 左上：头像 → 全局设置（桌面左侧 Drawer / 手机整页）。
-- 右上：功能按钮（多选/上传/显示设置），根据状态动态变化。
+- **顶栏只放操作，不放目录信息**。顶栏宽度有限，深目录的面包屑放那儿
+  必然被截断看不全。目录信息一律走内容区（见 §3.1.2）。
+- **顶栏左槽是固定位**：非多选放设置(menu)，多选放退出(X)。
+  两者必须占同一个位置 —— 让退出键跑到最右侧会导致进出多选时 icon 满屏换位，
+  是实打实的心智负担。同理"全选"也是图标而不是文字按钮，宽度不跳。
+- 右上：功能按钮 **全部平铺，不收进三点菜单**（多选/新建文件夹/上传/显示设置）。
+  收纳过的版本被否决 —— 常用操作藏两层不方便。
+- **桌面端右键菜单**：网格空白处 → 新建文件夹/刷新/上传；
+  缩略图上 → 打开/收藏/移动/删除。移动端不做右键。
 - 显示设置：桌面右侧 Drawer / 手机底部 Sheet。
-- **顶栏下横向筛选 chips**：`全部 / 图片 / 视频 / 收藏`，单选，联动 `mediaFilter`。
-  这是媒体类型筛选的唯一入口（显示设置抽屉里不再有"媒体类型"）。
-  选中"收藏"时隐藏文件夹区。
+
+### 3.1.2 内容区自上而下的顺序
+
+```
+顶栏           只有 menu/X + 操作按钮，无目录信息
+─────────────  ↑ 固定
+筛选 chips      全部 / 图片 / 视频 / 收藏
+─────────────  ↓ 跟着滚
+面包屑          仅在目录里时出现，每层可点，横向可滚
+搜索框          默认藏在视野上方
+文件夹网格
+媒体分组网格
+```
+
+**筛选 chips** 单选，联动 `mediaFilter`，是媒体类型筛选的唯一入口
+（显示设置抽屉里不再有"媒体类型"）。选中"收藏"时隐藏文件夹区。
+
+**面包屑**在内容区顶部，不在顶栏。每一层（含"首页"和当前层）都可点，
+当前层是实心深底白字。深目录横向可滚，加载后自动停在尾部让当前层可见。
+
+**搜索默认不可见**：首帧把滚动位置跳到 `_headerScrollExtent`，
+把搜索框顶出视野。滚到顶再往下拉一点才露出，位置介于内容和刷新指示器之间。
+它始终在 widget 树里，靠滚动位置隐藏而不是靠 `if` 摘除，所以下拉能连续把它带出来，
+继续下拉照样触发 `RefreshIndicator`，**刷新不受影响**。
+
+- **没有"搜索模式"这个状态**。有没有在搜索完全由 `_searchQuery` 是否为空决定，
+  不要再引入 `_searching` 布尔量：它和 `_searchQuery` 必然会不同步。
+- 输入时不发请求，只在 `onSubmitted` 提交。`onChanged` 仅用来让清除按钮显隐。
+- **换目录必须清搜索**（`_enterFolder` / `_goBack` / `_navigateToPathIndex` 三处）：
+  否则旧关键词会静默过滤新目录，连子文件夹一起藏掉。
+- `_headerScrollExtent` 要跟着 `_buildInlineHeader` 的实际构成走
+  （有无面包屑高度不同）。算少了会露出半截搜索框，算多了会把文件夹标题吃掉。
+
+### 3.1.3 返回手势：canPop 和 _handleBack 必须枚举同一组状态
+
+手机侧滑返回/返回键的处理集中在 `gallery_view` 的一个 `PopScope`，
+优先级从"最浮在上面"到"最底层"：
+
+| # | 状态 | 动作 |
+|---|---|---|
+| 1 | 查看器打开 | **只拦截，不处理** —— 查看器有自己的 PopScope 负责关闭动画 |
+| 2 | 多选中 | 退出多选 |
+| 3 | 有搜索结果 | 清搜索 |
+| 4 | 在子目录 | 回上一级 |
+| 5 | 都没有 | 真的 pop（退出 app） |
+
+**`canPop` 的条件必须和 `_handleBack` 的分支一一对应。** 漏掉一个状态的表现是
+"返回键越级"——比如漏了多选，长按进多选后按返回会直接退出当前文件夹。
+加新的可关闭状态（抽屉、弹层、编辑态…）时**两处一起改**。
+
+第 1 条的 `if (_viewerIndex != null) return;` 看着像空分支，但不能删：
+删了会继续往下落到第 4 条，变成"在查看器里按返回直接退出了当前文件夹"。
+
+### 3.1.4 铁律：条件包装会重置滚动位置
+
+**滚动子树里的 widget，其父节点类型不能随状态变化。** 这条踩过两次，
+表现都是"进多选/缩放后列表跳回顶部、缩略图变空白"：
+
+```dart
+// ✘ enabled 翻转时 child 的父节点类型变了，element 被卸载重建，
+//   CustomScrollView 的滚动位置直接丢失
+if (!enabled) return child;
+return RawGestureDetector(gestures: {...}, child: child);
+
+// ✔ 永远渲染同一层，只切内容。空 map 不会创建识别器，零开销
+return RawGestureDetector(
+  gestures: enabled ? {...} : const {},
+  child: child,
+);
+```
+
+同理 `_pinchWrap` 必须**永远**返回 `Transform.scale`（idle 时 scale=1.0），
+不能写 `if (idle) return child`。
+
+sliver 同理：用 `SliverOpacity` + `SliverIgnorePointer` 隐藏，
+不要用 `if (...)` 从 `slivers:` 数组里增删 —— 增删会让后续所有 sliver 位移。
+
+### 3.1.1 手势：必须用 RawGestureDetector，不要用 GestureDetector
+
+滚动容器里的自定义手势会和 ScrollView 的 `VerticalDragGestureRecognizer`
+抢手势竞技场，而 drag 通常先赢。踩过两次，都别再改回去：
+
+**滑选（`drag_select.dart`）** —— 用 `RawGestureDetector` +
+`DelayedMultiDragGestureRecognizer`（160ms），不要用 `onLongPressStart/MoveUpdate`。
+后者要等 500ms，期间任何移动都被 scroll 抢走，结果"按住滑动变成上下滚动"，
+滑选永远触发不了。命中判定走 hit-test 找 `DragSelectItem` 埋的 `MetaData`，
+不做网格几何换算 —— CustomScrollView 多 sliver（文件夹区 + 按天分组的多个网格）
+下几何根本算不出来。快速滑动时指针事件稀疏，要补齐跨过的中间下标。
+
+**双指缩放列数** —— 用 `Listener` 自己数指针，不要用 `ScaleGestureRecognizer`。
+数到 2 指就把 `physics` 换成 `NeverScrollableScrollPhysics` 让 scroll 退出竞争。
+缩放过程中只做 `Transform.scale` 视觉反馈，**松手才真正改列数**：过程中改列数
+每跨一档都要重建整棵网格，手感是一顿一顿的。
 
 ### 3.2 收藏
 - 数据：`media.favorite` 0/1，服务端 `PATCH /v1/media/{id}` 或 `POST /v1/media/batch-favorite`。
-- 查看器右上角星标按钮：实心黄=已收藏，空心=未收藏。
-- 多选工具栏星标按钮：选中项全部已收藏→取消收藏，否则→全部收藏。
+- 图标：`favorite_border`(空心) → `favorite`(实心)，颜色用近黑(#0F0F0F)而非黄色，查看器深色底上用纯白。
+- 缩略图角标：收藏时右上角显示白色小心形(12px)，不选择时才显示。
+- 多选工具栏心形按钮：选中项全部已收藏→取消收藏，否则→全部收藏。
+- chips「收藏」：纯文字，与「全部/图片/视频」风格一致，无图标。
 
 ### 3.3 下载（一律先选保存位置）
 - 单张（查看器）/ 打包（多选）：弹系统"另存为"对话框（桌面），移动端存到应用文档目录 `iGallery/`。
@@ -170,23 +285,22 @@ server/src/
 - 鼠标移入自动显示 UI（桌面），轻点显示/隐藏（手机）。
 - 左右箭头 + PageView 滑动切换。
 - 默认显示详情面板，点 info 隐藏。
-- 图片工具：缩放（10% 步进 + 百分比显示）、裁剪（8 手柄 + 三分线）、重命名、收藏。
-- 视频工具：播放/暂停。
-- 过渡动画可配（淡入/缩放/上滑/无）。
+- **工具栏只留三个**：关闭（左）· 缩放百分比 + 收藏 + 三点菜单（右）。
+  其余操作（下载/重命名/详情/删除）全部收进三点菜单。
+- 缩放：**点击百分比数字循环** 100% → 150% → 200% → 50%，不做 +/- 按钮。
+- 视频工具：播放/暂停 + 进度条 + 倍速 + 全屏。
+  倍速按钮必须自己订阅 `player.stream.rate`（它被塞进 `bottomButtonBar`，
+  父级 `setState` 不会重建它 —— 这是"倍速显示永远 1x"的根因）。
+- 过渡动画可配（淡入/缩放/无）。
+- **不做裁剪/编辑**。本项目定位是纯管理工具，不做图片编辑。
 
-### 3.5 裁剪
-- 四角 + 四边拖拽手柄，选区可整体拖动。
-- 保存模式可配：每次询问 / 覆盖原图 / 另存为新图。
-- 时间处理可配：保持原始拍摄时间 / 使用当前时间。
-- 流程：下载原图 → image 包 isolate 裁剪 → 上传（覆盖或新建）。
-
-### 3.6 多服务器
+### 3.5 多服务器
 - 启动默认连 `127.0.0.1:9600`，连不上 3 秒重试。
 - mDNS 发现并行运行。
 - 服务器列表：激活的绿色 ✓，其他可点击切换，× 删除。
 - 点击已激活的服务器取消选择。
 
-### 3.7 弹层规范
+### 3.6 弹层规范
 | 场景 | 移动端 | 桌面端 |
 |---|---|---|
 | 全局设置 | `Navigator.push` 整页 | 左侧 `Drawer` |
@@ -250,7 +364,25 @@ POST /v1/media/query
 - 流式写入磁盘（`field.chunk()`），不全量缓存内存。
 - SHA256 边写边算，写完去重。
 - Body limit 4GB，支持大视频。
-- 客户端发送文件修改时间作为 `taken_at` fallback（EXIF 优先）。
+
+**拍摄时间优先级（高 → 低），别再改顺序：**
+
+| # | 来源 | 谁提供 |
+|---|---|---|
+| 1 | `taken_at` 字段 | 客户端从系统相册库读到的权威值（移动端 `AssetEntity.createDateTime`） |
+| 2 | EXIF | `DateTimeOriginal` → `DateTime` |
+| 3 | QuickTime | 视频 `creation_time`（ffprobe） |
+| 4 | `file_mtime` 字段 | 客户端文件 mtime，最弱兜底 |
+
+- **1 必须压过 2**：移动端交上来的 File 是相册**导出的缓存副本**，mtime 是导出
+  那一刻；iOS 走 `PHImageManager` 导出时还可能把 EXIF `DateTime` 写成导出时刻，
+  那样 EXIF 反而是错的。系统相册库里的 `createDateTime` 才是真实拍摄时间。
+- **`taken_at` 和 `file_mtime` 必须分成两个字段**：合成一个的话，桌面端送上来的
+  mtime 会盖掉本该胜出的 EXIF。桌面选的是磁盘原文件，只送 `file_mtime`。
+- 两个字段都过 `normalize_ts()` 归一成北京时间 RFC3339，解析失败视为未提供。
+  cursor 分页按 `taken_at` **字符串**排序，格式不一致会让翻页乱序。
+- multipart 里这些字段必须排在 `file` 之前才生效。`http` 包的 `MultipartRequest`
+  先写 fields 再写 files，客户端天然满足，但换 HTTP 库时要重新确认。
 
 ### 4.4 完整 API 列表
 ```
@@ -295,7 +427,6 @@ GET    /v1/auth                 {required, authorized}（探测是否需 token�
 | 网格 | gridDensity | medium |
 | 分组 | groupMode | day |
 | 查看器 | viewerTransition | fade |
-| 裁剪 | cropSaveMode / cropTimeMode | ask / keepOriginal |
 
 ---
 
@@ -303,7 +434,6 @@ GET    /v1/auth                 {required, authorized}（探测是否需 token�
 
 - 几千张图片全走服务端分页 + 索引查询，客户端不做全量过滤。
 - 上传流式写磁盘，内存占用恒定。
-- 裁剪在 isolate 里执行（`compute`），不卡 UI。
 - 缩略图 300×300 JPEG，网格滚动流畅。
 - 长列表加 `RepaintBoundary`。
 - **磁盘缓存**（`core/disk_cache.dart`）：
@@ -332,7 +462,7 @@ GET    /v1/auth                 {required, authorized}（探测是否需 token�
 
 - 服务端：`cargo build` 编译通过。
 - 客户端：`flutter analyze` 零报错。
-- 端到端：启动服务端 → 客户端自动连接 → 上传/浏览/筛选/裁剪/删除/多服务器切换。
+- 端到端：启动服务端 → 客户端自动连接 → 上传/浏览/筛选/删除/多服务器切换。
 - 四端行为一致。
 
 ---
@@ -352,6 +482,23 @@ GET    /v1/auth                 {required, authorized}（探测是否需 token�
 | CocoaPods | 不需要 | 全部插件支持 SPM，macOS 走 `macos/Flutter/ephemeral/Packages/` |
 
 工具链固定为 Gradle 9.3.1 + AGP 9.1.0 + Kotlin 2.4.0，由 `client/android/` 下的 wrapper 和 settings 锁定。
+
+### 9.1.1 服务端运行时依赖：ffmpeg（可选）
+
+`thumb.rs` 用 `Command::new("ffmpeg")` / `ffprobe`，**纯走 PATH 解析**
+（Windows 上 std 自动补 `.exe`）。所以三端都一样：装好 + 加进 PATH + 重启服务，
+**不需要改配置、不需要写绝对路径、不需要重新编译**。
+
+- macOS：`brew install ffmpeg`
+- Windows：装 [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) 的 release build，
+  把 `bin/` 加进系统 PATH，**然后重开终端再启服务** —— PATH 变更不会作用于已运行的进程。
+- Linux（musl 静态包同样适用）：发行版包管理器装即可。
+
+缺了不会致命：视频照样能传能播，只是**没有缩略图**，时长/分辨率退回 `mp4parse`
+（只认 mp4/mov），QuickTime `creation_time` 也拿不到。
+
+启动日志会打印 `ffmpeg: OK` / `ffprobe: OK`，缺了就是
+`不在 PATH 上 —— 视频缩略图会缺失`。没法在目标机器上手动验证时看这两行就够了。
 
 ### 9.2 新机器初始化
 

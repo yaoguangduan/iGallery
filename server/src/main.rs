@@ -13,7 +13,9 @@ use axum::{extract::DefaultBodyLimit, middleware, routing, Router};
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tower_http::cors::CorsLayer;
+use tower_http::timeout::TimeoutLayer;
 
 #[derive(Parser)]
 #[command(name = "igallery-server", about = "iGallery 局域网相册服务")]
@@ -51,8 +53,9 @@ pub struct AppState {
     pub thumbs_dir: PathBuf,
     pub device_name: String,
     pub token: Option<String>,
-    /// M7: 持有 mDNS daemon，避免进程期间被 drop
-    pub _mdns: Arc<mdns_sd::ServiceDaemon>,
+    /// M7: 持有 mDNS daemon，避免进程期间被 drop。
+    /// None = mDNS 初始化失败，仅失去局域网自动发现，服务本身照常。
+    pub _mdns: Option<Arc<mdns_sd::ServiceDaemon>>,
 }
 
 #[tokio::main]
@@ -77,21 +80,29 @@ async fn main() {
 
     let pool = db::init_pool(&data_dir).await.expect("open sqlite");
 
-    // mDNS：失败不致命 (R1)，只警告
+    // mDNS：失败不致命 (R1)，只警告，降级为"无自动发现"继续服务。
+    // 旧实现在二次失败时 process::exit(0) —— 在不支持组播的容器里
+    // 整个服务会一声不吭地退出，与"非致命"的意图完全相反。
     let mdns_daemon = match mdns_sd::ServiceDaemon::new() {
-        Ok(d) => Arc::new(d),
+        Ok(d) => Some(Arc::new(d)),
         Err(e) => {
-            tracing::warn!("mDNS daemon init failed: {e} — 局域网自动发现将不可用");
-            Arc::new(mdns_sd::ServiceDaemon::new().unwrap_or_else(|_| {
-                // 二次失败，做个空 daemon 占位
-                std::process::exit(0)  // 不会走到这里，除非彻底不能创建
-            }))
+            tracing::warn!("mDNS daemon init failed: {e} — 重试一次");
+            match mdns_sd::ServiceDaemon::new() {
+                Ok(d) => Some(Arc::new(d)),
+                Err(e2) => {
+                    tracing::warn!("mDNS 不可用: {e2} —— 局域网自动发现将不可用，服务继续启动");
+                    None
+                }
+            }
         }
     };
-    mdns::register(&mdns_daemon, port, &device_name);
+    if let Some(daemon) = &mdns_daemon {
+        mdns::register(daemon, port, &device_name);
+    }
 
     let token = cli.token.clone();
 
+    let pool_for_purge = pool.clone();
     let state = AppState {
         pool,
         data_dir: data_dir.clone(),
@@ -102,24 +113,40 @@ async fn main() {
         _mdns: mdns_daemon,
     };
 
-    let app = Router::new()
+    // 路由分两组：
+    // - fast：查询/增删改等轻请求，套 60s 超时，防止卡住的连接永远占着；
+    // - slow：上传/下载/原图/缩略图，大文件本来就要传很久，不设超时
+    //   （客户端可随时掐断连接，服务端检测到写入失败会清理，见 stream_upload）。
+    let fast = Router::new()
         .route("/v1/media/query",       routing::post(media::query_media))
         .route("/v1/media/probe",       routing::post(media::probe))
-        .route("/v1/media/upload",      routing::post(media::upload))
-        .route("/v1/media/upload-batch", routing::post(media::upload_batch))
         .route("/v1/media/batch-delete", routing::post(media::batch_delete))
         .route("/v1/media/batch-move",  routing::post(media::batch_move))
         .route("/v1/media/batch-favorite", routing::post(media::batch_favorite))
-        .route("/v1/media/download",    routing::post(media::download_batch))
+        .route("/v1/media/{id}",        routing::delete(media::delete_media).patch(media::update_media))
+        .route("/v1/media/{id}/restore", routing::post(media::restore_media))
         .route("/v1/folders",           routing::get(folder::list_folders).post(folder::create_folder))
         .route("/v1/folders/{id}",      routing::get(folder::get_folder).patch(folder::rename_folder).delete(folder::delete_folder))
         .route("/v1/folders/{id}/ancestors", routing::get(folder::get_ancestors))
-        .route("/v1/media/{id}",        routing::get(media::get_media).delete(media::delete_media).patch(media::update_media))
-        .route("/v1/media/{id}/thumb",  routing::get(media::get_thumb))
-        .route("/v1/media/{id}/download", routing::get(media::download_single))
-        .route("/v1/media/{id}/restore", routing::post(media::restore_media))
         .route("/v1/auth",              routing::get(auth::auth_probe))
         .route("/v1/info",              routing::get(media::server_info))
+        .route("/v1/logs",              routing::post(receive_client_logs))
+        .layer(TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(60),
+        ));
+
+    let slow = Router::new()
+        .route("/v1/media/upload",      routing::post(media::upload))
+        .route("/v1/media/upload-batch", routing::post(media::upload_batch))
+        .route("/v1/media/download",    routing::post(media::download_batch))
+        .route("/v1/media/{id}",        routing::get(media::get_media))
+        .route("/v1/media/{id}/thumb",  routing::get(media::get_thumb))
+        .route("/v1/media/{id}/download", routing::get(media::download_single));
+
+    let app = Router::new()
+        .merge(fast)
+        .merge(slow)
         .layer(middleware::from_fn_with_state(state.clone(), auth::require_token))
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024 * 1024)) // 4 GB
         .layer(CorsLayer::permissive())
@@ -135,7 +162,68 @@ async fn main() {
     } else {
         tracing::warn!("  auth:   DISABLED — 局域网内任何设备可访问");
     }
+    thumb::probe_toolchain();
+
+    // 后台定期清理"删除超过 30 天"的条目（回收站语义：期内可 restore）。
+    // 用 state 之前的那份 pool/路径，state 已经交给 router 了。
+    tokio::spawn(purge_loop(pool_for_purge, media_dir.clone(), thumbs_dir.clone()));
 
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
     axum::serve(listener, app).await.expect("serve");
+}
+
+/// 软删除 30 天后物理清理：删 DB 行 + 媒体文件 + 缩略图。
+/// 失败只告警，下个周期再来，绝不影响主服务。
+async fn purge_loop(pool: sqlx::SqlitePool, media_dir: PathBuf, thumbs_dir: PathBuf) {
+    let mut interval = tokio::time::interval(Duration::from_secs(6 * 3600));
+    interval.tick().await; // 首次立即触发，跳过
+    loop {
+        interval.tick().await;
+        let cutoff = crate::time::to_beijing_rfc3339(chrono::Utc::now() - chrono::Duration::days(30));
+        let rows = match db::select_purgeable(&pool, &cutoff, 1000).await {
+            Ok(r) => r,
+            Err(e) => { tracing::warn!("purge select: {e}"); continue; }
+        };
+        if rows.is_empty() { continue; }
+
+        match db::purge_ids(&pool, &rows).await {
+            Ok(n) if n > 0 => {
+                for (id, ext) in &rows {
+                    // 文件删不掉只告警：行已经没了，客户端不会再引用到
+                    let _ = tokio::fs::remove_file(media_dir.join(format!("{id}.{ext}"))).await;
+                    let _ = tokio::fs::remove_file(thumbs_dir.join(format!("{id}.jpg"))).await;
+                }
+                tracing::info!("purge: 物理清理了 {n} 条删除超过 30 天的记录");
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("purge delete: {e}"),
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ClientLogEntry {
+    level: String,
+    message: String,
+    detail: Option<String>,
+    created_at: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+struct ClientLogsBody {
+    logs: Vec<ClientLogEntry>,
+}
+
+async fn receive_client_logs(
+    axum::Json(body): axum::Json<ClientLogsBody>,
+) -> impl axum::response::IntoResponse {
+    for entry in &body.logs {
+        let detail = entry.detail.as_deref().unwrap_or("");
+        match entry.level.as_str() {
+            "error" => tracing::error!(target: "client", "{} {}", entry.message, detail),
+            "warn"  => tracing::warn!(target: "client", "{} {}", entry.message, detail),
+            _       => tracing::info!(target: "client", "{} {}", entry.message, detail),
+        }
+    }
+    axum::Json(serde_json::json!({"received": body.logs.len()}))
 }

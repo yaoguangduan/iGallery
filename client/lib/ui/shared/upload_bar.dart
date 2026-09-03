@@ -51,17 +51,22 @@ class _UploadBarState extends State<UploadBar> {
     final speed = m.speedBps;
     final eta = m.eta;
     final done = !m.uploading;
+    final hasIssue = m.failCount > 0 || m.cancelCount > 0;
 
     final parts = <String>[
       if (done)
         '已完成 ${m.completed}/${m.total}'
+      else if (m.cancelling)
+        '正在取消…'
       else if (m.currentFilename.isNotEmpty)
         m.currentFilename,
-      if (!done) '${m.completed}/${m.total}',
-      if (!done && speed > 0) '${_fmtBytes(speed)}/s',
-      if (!done && eta != null) 'ETA ${_fmtEta(eta)}',
+      if (!done && !m.cancelling) '${m.completed}/${m.total}',
+      if (!done && !m.cancelling && speed > 0) '${_fmtBytes(speed)}/s',
+      if (!done && !m.cancelling && eta != null) 'ETA ${_fmtEta(eta)}',
       if (m.dedupCount > 0) '${m.dedupCount} 已存在',
       if (m.failCount > 0) '${m.failCount} 失败',
+      if (m.cancelCount > 0) '${m.cancelCount} 已取消',
+      if (done && m.lastError != null) m.lastError!,
     ];
 
     return Material(
@@ -80,17 +85,40 @@ class _UploadBarState extends State<UploadBar> {
                 minHeight: 2,
                 backgroundColor: c.outline,
                 valueColor: AlwaysStoppedAnimation(
-                  m.failCount > 0 && !m.uploading ? c.warn : c.brand),
+                  hasIssue && !m.uploading ? c.warn : c.brand),
               ),
             ),
             Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+              padding: const EdgeInsets.only(left: 16, right: 4, top: 4, bottom: 4),
               child: Row(children: [
                 Expanded(child: Text(
                   parts.join(' · '),
                   maxLines: 1, overflow: TextOverflow.ellipsis,
                   style: TextStyle(color: c.onSurfaceVariant, fontSize: AppType.xs),
                 )),
+                // 上传中给"取消"，结束后给"收起"。
+                // 没有取消入口时，传大文件卡住就只能杀 app。
+                if (m.uploading)
+                  TextButton(
+                    onPressed: m.cancelling ? null : m.cancel,
+                    style: TextButton.styleFrom(
+                      minimumSize: const Size(0, 32),
+                      padding: const EdgeInsets.symmetric(horizontal: 10),
+                      visualDensity: VisualDensity.compact,
+                    ),
+                    child: Text('取消',
+                        style: TextStyle(
+                            color: m.cancelling ? c.onMuted : c.brand,
+                            fontSize: AppType.xs,
+                            fontWeight: FontWeight.w600)),
+                  )
+                else
+                  IconButton(
+                    onPressed: m.dismiss,
+                    icon: Icon(Icons.close, size: AppIconSize.sm, color: c.onMuted),
+                    visualDensity: VisualDensity.compact,
+                    tooltip: '收起',
+                  ),
                 Icon(Icons.chevron_right, size: 14, color: c.onMuted),
               ]),
             ),

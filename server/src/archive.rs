@@ -49,26 +49,47 @@ async fn build_zip_streaming(
         };
 
         // 图片/视频通常已压缩，用 Stored 更快
-        let entry = ZipEntryBuilder::new(zip_name.into(), Compression::Stored).build();
+        let entry = ZipEntryBuilder::new(zip_name.clone().into(), Compression::Stored).build();
         let mut entry_writer = match zip.write_entry_stream(entry).await {
             Ok(w) => w,
             Err(e) => { tracing::warn!("zip start {stored_name}: {e}"); continue; }
         };
 
         let mut buf = vec![0u8; 64 * 1024];
+        let mut truncated = false;
         loop {
             let n = match file.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => n,
-                Err(e) => { tracing::warn!("zip read {stored_name}: {e}"); break; }
+                Err(e) => {
+                    tracing::warn!("zip read {stored_name}: {e}");
+                    truncated = true;
+                    break;
+                }
             };
             if let Err(e) = futures::AsyncWriteExt::write_all(&mut entry_writer, &buf[..n]).await {
                 tracing::warn!("zip write {stored_name}: {e}");
+                truncated = true;
                 break;
             }
         }
         if let Err(e) = entry_writer.close().await {
             tracing::warn!("zip close entry {stored_name}: {e}");
+            truncated = true;
+        }
+        // 读到一半失败的条目会变成一个看似正常的坏文件。
+        // 补一条 <名字>.INCOMPLETE.txt 说明，用户解压时一眼看到，
+        // 而不是拿回一张打不开的图去猜。
+        if truncated {
+            let note_name = format!("{zip_name}.INCOMPLETE.txt");
+            let note = format!(
+                "文件 {zip_name} 在打包过程中读取失败，压缩包内的这份数据不完整，请重新下载。\n"
+            );
+            let entry = ZipEntryBuilder::new(note_name.into(), Compression::Stored).build();
+            if let Ok(mut w) = zip.write_entry_stream(entry).await {
+                let _ = futures::AsyncWriteExt::write_all(&mut w, note.as_bytes()).await;
+                let _ = w.close().await;
+            }
         }
     }
 

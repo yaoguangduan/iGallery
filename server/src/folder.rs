@@ -180,9 +180,20 @@ pub async fn get_ancestors(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let mut ancestors: Vec<serde_json::Value> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut current_id = Some(id);
 
+    // seen 防环：脏数据造成 parent 互指时，没有这层保护会死循环把连接挂死。
+    // 深度也封顶，正常目录层级远到不了 256。
     while let Some(ref cid) = current_id {
+        if !seen.insert(cid.clone()) {
+            tracing::warn!("folder ancestors: 检测到环，在 {cid} 处截断");
+            break;
+        }
+        if ancestors.len() >= 256 {
+            tracing::warn!("folder ancestors: 层级超过 256，截断");
+            break;
+        }
         match db::get_folder(&state.pool, cid).await {
             Ok(Some(row)) => {
                 ancestors.push(serde_json::json!({"id": row.id, "name": row.name}));

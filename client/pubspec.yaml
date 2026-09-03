@@ -6,7 +6,7 @@ publish_to: 'none'
 # plugin cannot parse as an integer, so it silently ships versionCode 1. A frozen
 # +1 has the same effect by hand. Both halves are maintained by tool/ship.sh
 # (code = major*10000 + minor*100 + patch).
-version: 0.1.4+104
+version: 0.1.9+109
 
 environment:
   sdk: ^3.10.0
@@ -33,6 +33,7 @@ dependencies:
   crypto: ^3.0.6
   connectivity_plus: ^6.1.0
   uuid: ^4.5.1
+  photo_manager: ^3.6.0
 
 dev_dependencies:
   flutter_test:

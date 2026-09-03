@@ -115,6 +115,31 @@ class UploadResult {
   UploadResult({required this.item, required this.dedup});
 }
 
+/// 用户主动取消上传时抛出。UploadManager 据此把该项记为"已取消"而不是"失败"。
+class UploadCancelledException implements Exception {
+  const UploadCancelledException();
+  @override
+  String toString() => '已取消';
+}
+
+/// 上传取消令牌。一批共用一个：点"取消"后剩余文件全部停下。
+class UploadCancelToken {
+  bool _cancelled = false;
+  bool get isCancelled => _cancelled;
+  void cancel() => _cancelled = true;
+  void throwIfCancelled() {
+    if (_cancelled) throw const UploadCancelledException();
+  }
+}
+
+/// 逐个下载的结果统计，UI 据此如实汇报而不是一律"已下载 N 个"
+class DownloadReport {
+  final int ok;
+  final int failed;
+  const DownloadReport({required this.ok, required this.failed});
+  int get total => ok + failed;
+}
+
 class FolderItem {
   final String id;
   final String name;
@@ -205,10 +230,17 @@ class MediaService {
   }
 
   /// 单文件上传：返回 UploadResult（含 dedup）
+  ///
+  /// [onSent] 按字节回调已发送量，用于大文件进度条 —— 没有它的话，
+  /// 传一个 2 GB 的视频时进度会在 0% 停十几分钟，和卡死没有区别。
+  /// [cancelToken] 供用户中途取消；取消后底层连接直接断开，
+  /// 服务端 stream_upload 检测到流中断会删掉半截文件、不写库。
   Future<UploadResult?> uploadFile(
     File file, {
     String? folderId,
     String? takenAtIso,
+    void Function(int sent)? onSent,
+    UploadCancelToken? cancelToken,
   }) async {
     final filename = file.path.split(Platform.pathSeparator).last;
     final size = await file.length();
@@ -217,31 +249,44 @@ class MediaService {
     if (size < 5 * 1024 * 1024 * 1024) {
       try {
         final sum = await sha256File(file);
+        cancelToken?.throwIfCancelled();
         final existing = await probe(sum);
         if (existing != null) {
           return UploadResult(item: existing, dedup: true);
         }
+      } on UploadCancelledException {
+        rethrow;
       } catch (_) {
         // probe 失败不阻塞上传
       }
     }
+    cancelToken?.throwIfCancelled();
 
     final request = http.MultipartRequest('POST', Uri.parse('$_base/v1/media/upload'));
     request.headers.addAll(authHeaders);
-    request.files.add(await http.MultipartFile.fromPath(
-      'file', file.path, filename: filename, contentType: guessMime(filename),
-    ));
+    // taken_at = 权威拍摄时间（移动端从系统相册库读到），压过 EXIF。
+    // file_mtime = 最弱兜底，只在 taken_at 和 EXIF 都拿不到时才被服务端采用。
+    // 两者分开发，否则桌面端的 mtime 会盖掉本该胜出的 EXIF。
+    //
+    // fields 必须在 files 之前加：服务端按到达顺序读，晚于 file 的字段不生效。
     if (takenAtIso != null) {
       request.fields['taken_at'] = takenAtIso;
-    } else {
-      try {
-        final stat = await file.stat();
-        request.fields['taken_at'] = toServerRfc3339(stat.modified);
-      } catch (_) {}
     }
+    try {
+      final stat = await file.stat();
+      request.fields['file_mtime'] = toServerRfc3339(stat.modified);
+    } catch (_) {}
     if (folderId != null) request.fields['folder_id'] = folderId;
 
-    final response = await request.send();
+    request.files.add(http.MultipartFile(
+      'file',
+      _countingStream(file.openRead(), onSent, cancelToken),
+      size,
+      filename: filename,
+      contentType: guessMime(filename),
+    ));
+
+    final response = await Api.instance.client.send(request);
     final body = await response.stream.bytesToString();
     if (response.statusCode != 200) {
       throw ApiException(
@@ -250,13 +295,44 @@ class MediaService {
         statusCode: response.statusCode,
       );
     }
-    final list = jsonDecode(body) as List;
+    final json = jsonDecode(body);
+    // new response format: {items: [...], errors: [...]}
+    if (json is Map<String, dynamic> && json.containsKey('items')) {
+      final items = json['items'] as List;
+      final errors = (json['errors'] as List?) ?? [];
+      if (items.isEmpty && errors.isNotEmpty) {
+        final e = errors.first as Map<String, dynamic>;
+        final name = (e['filename'] as String?) ?? '';
+        final msg = '${e['error']}';
+        throw ApiException(ApiErrorKind.server, name.isEmpty ? msg : '$name: $msg');
+      }
+      if (items.isEmpty) return null;
+      final j = items.first as Map<String, dynamic>;
+      return UploadResult(item: MediaItem.fromJson(j), dedup: j['dedup'] == true);
+    }
+    // legacy: plain array response
+    final list = json as List;
     if (list.isEmpty) return null;
     final j = list.first as Map<String, dynamic>;
     return UploadResult(
       item: MediaItem.fromJson(j),
       dedup: j['dedup'] == true,
     );
+  }
+
+  /// 包一层文件流：边发边报字节数，并在取消时抛出中断上传。
+  Stream<List<int>> _countingStream(
+    Stream<List<int>> source,
+    void Function(int sent)? onSent,
+    UploadCancelToken? token,
+  ) async* {
+    var sent = 0;
+    await for (final chunk in source) {
+      token?.throwIfCancelled();
+      sent += chunk.length;
+      onSent?.call(sent);
+      yield chunk;
+    }
   }
 
   Future<UploadResult?> uploadBytes({
@@ -325,20 +401,30 @@ class MediaService {
 
     final response = await Api.instance.client.send(request);
     if (response.statusCode != 200) {
-      throw ApiException(ApiErrorKind.server, 'zip ${response.statusCode}');
+      await response.stream.drain();
+      throw ApiException(ApiErrorKind.server, 'zip ${response.statusCode}',
+          statusCode: response.statusCode);
     }
     final file = File(savePath);
     final sink = file.openWrite();
-    await response.stream.pipe(sink);
+    try {
+      await response.stream.pipe(sink);
+    } catch (e) {
+      // 传到一半断了：删掉半截 zip，别让用户拿到一个打不开的包
+      await sink.close().catchError((_) {});
+      try { await file.delete(); } catch (_) {}
+      rethrow;
+    }
     await sink.close();
     return file;
   }
 
-  Future<void> downloadIndividual(
+  Future<DownloadReport> downloadIndividual(
     List<String> ids, {
     required String saveDir,
     void Function(int completed, int total)? onProgress,
   }) async {
+    var ok = 0, failed = 0;
     for (var i = 0; i < ids.length; i++) {
       final id = ids[i];
       try {
@@ -346,9 +432,16 @@ class MediaService {
         if (resp.statusCode == 200) {
           final filename = parseContentDispositionFilename(
               resp.headers['content-disposition'], id);
-          final file = File('$saveDir/$filename');
+          final file = uniqueFile(saveDir, filename);
           final sink = file.openWrite();
-          await resp.stream.pipe(sink);
+          try {
+            await resp.stream.pipe(sink);
+          } catch (e) {
+            // 写到一半断了：删掉半截文件，不留下打不开的残骸
+            await sink.close().catchError((_) {});
+            try { await file.delete(); } catch (_) {}
+            rethrow;
+          }
           await sink.close();
           final takenAt = resp.headers['x-taken-at'];
           if (takenAt != null) {
@@ -357,14 +450,19 @@ class MediaService {
               try { await file.setLastModified(dt); } catch (_) {}
             }
           }
+          ok++;
         } else {
           await resp.stream.drain();
+          failed++;
         }
       } catch (_) {
-        // 单个失败不中断整批
+        // 单个失败不中断整批，但要计数 —— 旧实现全吞掉，
+        // 5 个挂 2 个也照样提示"已下载 5 个"
+        failed++;
       }
       onProgress?.call(i + 1, ids.length);
     }
+    return DownloadReport(ok: ok, failed: failed);
   }
 
   Future<ServerStats> fetchInfo() async {
@@ -413,4 +511,24 @@ String parseContentDispositionFilename(String? disposition, String fallback) {
   final m = RegExp(r'filename="?([^";]+)"?').firstMatch(disposition);
   if (m != null) return m.group(1)!;
   return fallback;
+}
+
+/// 目标目录里取一个不冲突的文件名：`a.jpg` 已存在就用 `a (1).jpg`。
+///
+/// 直接覆盖是"静默毁数据"：用户下载两张同名照片，第二张会把第一张盖掉，
+/// 而且全程没有任何提示。系统下载器都是这个 `(n)` 规则。
+File uniqueFile(String dir, String filename) {
+  final sep = Platform.pathSeparator;
+  var candidate = File('$dir$sep$filename');
+  if (!candidate.existsSync()) return candidate;
+
+  final dot = filename.lastIndexOf('.');
+  final stem = dot > 0 ? filename.substring(0, dot) : filename;
+  final ext = dot > 0 ? filename.substring(dot) : '';
+  for (var n = 1; n < 1000; n++) {
+    candidate = File('$dir$sep$stem ($n)$ext');
+    if (!candidate.existsSync()) return candidate;
+  }
+  // 1000 个重名还没排开，用时间戳兜底，总之不覆盖
+  return File('$dir$sep$stem ${DateTime.now().millisecondsSinceEpoch}$ext');
 }
