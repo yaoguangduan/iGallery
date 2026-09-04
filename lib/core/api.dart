@@ -5,6 +5,8 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
+import 'log_service.dart';
+
 /// 统一 HTTP 层 (R4):
 /// - 单例 http.Client，socket 复用
 /// - 分档超时：connect 10s，普通读写 60s，上传/下载不限（依赖底层活性）
@@ -44,7 +46,25 @@ class ApiException implements Exception {
     ApiErrorKind.badRequest    => '请求参数错误',
     ApiErrorKind.unknown       => '未知错误',
   };
+
+  /// toast 用的文案。服务端给了人话（如"文件夹不为空"）就用它，
+  /// 否则退回 kind 的通用描述。
+  ///
+  /// **不要在 UI 里拼 `'$e'`** —— 那样用户看到的是
+  /// `ApiException(server, 500): 500` 这种内部字符串。
+  String get displayMessage {
+    final m = message.trim();
+    if (m.isEmpty) return userMessage;
+    // 纯数字（_fromStatus 拿不到 error 字段时的兜底）没有信息量
+    if (int.tryParse(m) != null) return userMessage;
+    return m;
+  }
 }
+
+/// 把任意异常转成能给用户看的一句话。
+/// UI 层的 catch 一律走这里，杜绝 `'失败: $e'`。
+String errorText(Object e) =>
+    e is ApiException ? e.displayMessage : '操作失败';
 
 class Api {
   static final Api instance = Api._();
@@ -52,6 +72,16 @@ class Api {
 
   final http.Client _client = http.Client();
   http.Client get client => _client;
+
+  /// 收到 401/403 时回调，由 ServerState 注册。
+  ///
+  /// 没有这个钩子的话，token 失效后每个请求各弹一次"未授权"，
+  /// 但连接状态永远停在 connected，用户永远等不到重新输令牌的入口。
+  void Function()? onUnauthorized;
+
+  void _notifyUnauthorized(ApiException e) {
+    if (e.kind == ApiErrorKind.unauthorized) onUnauthorized?.call();
+  }
 
   Map<String, String> _headers({Map<String, String>? extra, bool json = false}) {
     final h = <String, String>{};
@@ -76,18 +106,33 @@ class Api {
   Future<T> _wrap<T>(Future<T> Function() fn) async {
     try {
       return await fn();
-    } on ApiException {
+    } on ApiException catch (e) {
+      _logError(e);
       rethrow;
     } on TimeoutException {
-      throw ApiException(ApiErrorKind.timeout, '请求超时');
+      final e = ApiException(ApiErrorKind.timeout, '请求超时');
+      _logError(e);
+      throw e;
     } on SocketException catch (e) {
-      throw ApiException(ApiErrorKind.network, e.message);
+      final ae = ApiException(ApiErrorKind.network, e.message);
+      _logError(ae);
+      throw ae;
     } on http.ClientException catch (e) {
-      throw ApiException(ApiErrorKind.network, e.message);
+      final ae = ApiException(ApiErrorKind.network, e.message);
+      _logError(ae);
+      throw ae;
     } catch (e, st) {
       if (kDebugMode) debugPrint('api unknown: $e\n$st');
-      throw ApiException(ApiErrorKind.unknown, e.toString());
+      final ae = ApiException(ApiErrorKind.unknown, e.toString());
+      _logError(ae);
+      throw ae;
     }
+  }
+
+  void _logError(ApiException e) {
+    LogService.instance.warn('API ${e.kind.name}: ${e.message}',
+        detail: 'statusCode=${e.statusCode}');
+    _notifyUnauthorized(e);
   }
 
   ApiException _fromStatus(int code, String body) {

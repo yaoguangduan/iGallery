@@ -13,6 +13,7 @@ import 'core/display_prefs.dart';
 import 'core/kv_store.dart';
 import 'core/log_service.dart';
 import 'core/server_state.dart';
+import 'core/hash_sync.dart';
 import 'core/upload_history.dart';
 import 'theme/app_theme.dart';
 
@@ -43,6 +44,7 @@ Future<void> main() async {
     // 上次进程被杀时遗留的 "进行中" 记录标成中断，
     // 否则用户会一直看到永远转圈的假记录
     await UploadHistory.markStalePending();
+    await HashSync.instance.loadLocal();
 
     final displayPrefs = DisplayPrefs();
     await displayPrefs.load();

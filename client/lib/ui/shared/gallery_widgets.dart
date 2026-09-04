@@ -1,4 +1,4 @@
-// gallery 里三块可独立的 widget：MediaThumb、FolderThumb、FolderPickerDialog
+// gallery 里三块可独立的 widget：MediaThumb、FolderThumb、FolderPickerSheet
 // 拆出以给 gallery_view.dart 瘦身 (M1)
 
 import 'package:flutter/material.dart';
@@ -169,8 +169,10 @@ class MediaThumb extends StatelessWidget {
   Widget _label(Color primary, Color secondary) {
     final parts = <Widget>[];
     final ts = TextStyle(color: secondary, fontSize: AppType.xxs);
-    if (prefs.showName) parts.add(Text(item.filename, maxLines: 1, overflow: TextOverflow.ellipsis,
+    if (prefs.showName) {
+      parts.add(Text(item.filename, maxLines: 1, overflow: TextOverflow.ellipsis,
         style: TextStyle(color: primary, fontSize: AppType.xs, fontWeight: FontWeight.w500)));
+    }
     if (prefs.showTime) {
       final text = fmtDateShort(item.displayDate);
       if (text.isNotEmpty) parts.add(Text(text, maxLines: 1, style: ts));
@@ -317,17 +319,18 @@ class _FolderPainter extends CustomPainter {
 }
 
 /// 移动到 ... 的文件夹选择器
-class FolderPickerDialog extends StatefulWidget {
+class FolderPickerSheet extends StatefulWidget {
   final MediaService service;
   final String? currentFolderId;
+  final String? excludeFolderId;
 
-  const FolderPickerDialog({super.key, required this.service, this.currentFolderId});
+  const FolderPickerSheet({super.key, required this.service, this.currentFolderId, this.excludeFolderId});
 
   @override
-  State<FolderPickerDialog> createState() => _FolderPickerDialogState();
+  State<FolderPickerSheet> createState() => _FolderPickerSheetState();
 }
 
-class _FolderPickerDialogState extends State<FolderPickerDialog> {
+class _FolderPickerSheetState extends State<FolderPickerSheet> {
   List<FolderItem> _folders = [];
   String? _browseFolderId;
   final List<({String id, String name})> _path = [];
@@ -343,10 +346,11 @@ class _FolderPickerDialogState extends State<FolderPickerDialog> {
   Future<void> _load() async {
     setState(() { _loading = true; _loadError = false; });
     try {
-      _folders = await widget.service.listFolders(parentId: _browseFolderId);
+      var list = await widget.service.listFolders(parentId: _browseFolderId);
+      final ex = widget.excludeFolderId;
+      if (ex != null) list = list.where((f) => f.id != ex).toList();
+      _folders = list;
     } catch (_) {
-      // 加载失败不能显示成"无子文件夹"——那是两种完全不同的情况，
-      // 前者用户重试就好，后者会让用户误以为真的没有文件夹
       _loadError = true;
       _folders = [];
     }
@@ -369,76 +373,85 @@ class _FolderPickerDialogState extends State<FolderPickerDialog> {
   @override
   Widget build(BuildContext context) {
     final c = context.colors;
-    return AlertDialog(
-      backgroundColor: c.surface,
-      title: Text('移动到', style: TextStyle(color: c.onSurface, fontSize: AppType.mdPlus, fontWeight: FontWeight.w600)),
-      content: SizedBox(
-        width: 300, height: 360,
-        child: Column(children: [
-          if (_path.isNotEmpty)
-            Row(children: [
-              GestureDetector(
-                onTap: _goUp,
-                child: Icon(Icons.arrow_back, size: 18, color: c.brand),
-              ),
-              const SizedBox(width: 8),
-              Expanded(child: Text(
-                _path.map((e) => e.name).join(' / '),
-                maxLines: 1, overflow: TextOverflow.ellipsis,
-                style: TextStyle(color: c.onMuted, fontSize: AppType.xs),
-              )),
-            ]),
-          if (_path.isNotEmpty) const SizedBox(height: 8),
-          Expanded(
-            child: _loading
-                ? const Center(child: AppSpinner())
-                : _loadError
-                ? Center(
-                    child: Column(mainAxisSize: MainAxisSize.min, children: [
-                      Icon(Icons.error_outline, color: c.error, size: AppIconSize.hero),
-                      const SizedBox(height: 8),
-                      Text('加载失败', style: TextStyle(color: c.onSurfaceVariant, fontSize: AppType.sm)),
-                      const SizedBox(height: 12),
-                      AppButton(label: '重试', primary: false, onTap: _load),
-                    ]),
-                  )
-                : ListView(children: [
-                    ListTile(
-                      dense: true,
-                      leading: Icon(Icons.home_outlined, color: c.onSurfaceVariant),
-                      title: Text('公共空间 (根目录)', style: TextStyle(color: c.onSurface, fontSize: AppType.sm)),
-                      onTap: () => Navigator.pop(context, ''),
-                    ),
-                    for (final f in _folders)
-                      ListTile(
-                        dense: true,
-                        leading: Icon(Icons.folder, color: c.onSurfaceVariant),
-                        title: Text(f.name, style: TextStyle(color: c.onSurface, fontSize: AppType.sm)),
-                        subtitle: Text('${f.itemCount} 项', style: TextStyle(color: c.onMuted, fontSize: 10)),
-                        trailing: Icon(Icons.chevron_right, size: 18, color: c.onMuted),
-                        onTap: () => Navigator.pop(context, f.id),
-                        onLongPress: () => _enter(f),
-                      ),
-                    if (_folders.isEmpty && !_loading)
-                      Padding(
-                        padding: const EdgeInsets.all(24),
-                        child: Center(child: Text('无子文件夹', style: TextStyle(color: c.onMuted, fontSize: AppType.xs))),
-                      ),
-                  ]),
-          ),
+    return Column(children: [
+      const SheetHandle(),
+      Padding(
+        padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
+        child: Row(children: [
+          if (_path.isNotEmpty) ...[
+            GestureDetector(
+              onTap: _goUp,
+              child: Icon(Icons.arrow_back, size: 20, color: c.brand),
+            ),
+            const SizedBox(width: 8),
+          ],
+          Expanded(child: Text(
+            _path.isEmpty ? '移动到' : _path.map((e) => e.name).join(' / '),
+            maxLines: 1, overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: _path.isEmpty ? c.onSurface : c.onMuted,
+              fontSize: _path.isEmpty ? AppType.mdPlus : AppType.xs,
+              fontWeight: _path.isEmpty ? FontWeight.w700 : FontWeight.w500,
+            ),
+          )),
         ]),
       ),
-      actions: [
-        if (_browseFolderId != null)
-          TextButton(
-            onPressed: () => Navigator.pop(context, _browseFolderId),
-            child: Text('移到当前文件夹', style: TextStyle(color: c.brand, fontWeight: FontWeight.w600)),
-          ),
-        TextButton(
-          onPressed: () => Navigator.pop(context, null),
-          child: Text('取消', style: TextStyle(color: c.onSurfaceVariant)),
+      const SizedBox(height: 8),
+      Expanded(
+        child: _loading
+            ? const Center(child: AppSpinner())
+            : _loadError
+            ? Center(
+                child: Column(mainAxisSize: MainAxisSize.min, children: [
+                  Icon(Icons.error_outline, color: c.error, size: AppIconSize.hero),
+                  const SizedBox(height: 8),
+                  Text('加载失败', style: TextStyle(color: c.onSurfaceVariant, fontSize: AppType.sm)),
+                  const SizedBox(height: 12),
+                  AppButton(label: '重试', primary: false, onTap: _load),
+                ]),
+              )
+            : ListView(children: [
+                for (final f in _folders)
+                  ListTile(
+                    visualDensity: const VisualDensity(vertical: -2),
+                    leading: Icon(Icons.folder, size: 20, color: c.onSurfaceVariant),
+                    title: Text(f.name, style: TextStyle(color: c.onSurface, fontSize: AppType.sm)),
+                    trailing: Icon(Icons.chevron_right, size: 18, color: c.onMuted),
+                    onTap: () => _enter(f),
+                  ),
+                if (_folders.isEmpty && !_loading)
+                  Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Center(child: Text('无子文件夹', style: TextStyle(color: c.onMuted, fontSize: AppType.xs))),
+                  ),
+              ]),
+      ),
+      SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+          child: Row(children: [
+            Expanded(child: OutlinedButton(
+              onPressed: () => Navigator.pop(context, null),
+              style: OutlinedButton.styleFrom(
+                foregroundColor: c.onSurfaceVariant,
+                side: BorderSide(color: c.outline),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(AppRadius.chip)),
+              ),
+              child: const Text('取消'),
+            )),
+            const SizedBox(width: 12),
+            Expanded(child: FilledButton(
+              onPressed: () => Navigator.pop(context, _browseFolderId ?? ''),
+              style: FilledButton.styleFrom(
+                backgroundColor: c.brand,
+                foregroundColor: c.onScrim,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(AppRadius.chip)),
+              ),
+              child: Text(_browseFolderId == null ? '移到根目录' : '移到此处'),
+            )),
+          ]),
         ),
-      ],
-    );
+      ),
+    ]);
   }
 }

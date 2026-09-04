@@ -2,10 +2,12 @@ import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
 import '../../core/api.dart';
 import '../../core/display_prefs.dart';
+import '../../core/hash_sync.dart';
 import '../../core/download_service.dart';
 import '../../core/media_service.dart';
 import '../../core/platform.dart';
@@ -16,23 +18,54 @@ import '../../theme/app_theme.dart';
 import 'app_kit.dart';
 import 'app_toast.dart';
 import 'cached_thumb.dart';
+import 'drag_select.dart';
 import 'gallery_groups.dart';
 import 'gallery_widgets.dart';
+import 'media_picker.dart';
 import 'media_viewer.dart';
 import 'settings_sheet.dart';
 import 'upload_bar.dart';
 import 'upload_history_page.dart';
 
+/// Shell 层回调接口，避免 gallery_view 和 gallery_shell 循环依赖。
+abstract class GalleryShellHost {
+  void openViewer({
+    required List<MediaItem> items,
+    required int index,
+    required MediaService service,
+    void Function(String)? onDeleted,
+  });
+  void updateSelection({
+    required bool selecting,
+    required Set<String> selectedIds,
+    required bool allSelected,
+    required bool allFavorite,
+    VoidCallback? onToggleSelectAll,
+    VoidCallback? onFavorite,
+    VoidCallback? onMove,
+    VoidCallback? onDownload,
+    VoidCallback? onDelete,
+    VoidCallback? onExitSelection,
+  });
+  void pickAndUpload({String? folderId});
+  void switchToTab(int index);
+}
+
 bool get _isDesktop => isDesktop;
 
+enum GalleryMode { allMedia, albums }
+
 class GalleryView extends StatefulWidget {
-  const GalleryView({super.key});
+  final GalleryMode mode;
+  final GalleryShellHost? shell;
+  const GalleryView({super.key, this.mode = GalleryMode.albums, this.shell});
 
   @override
   State<GalleryView> createState() => _GalleryViewState();
 }
 
-class _GalleryViewState extends State<GalleryView> {
+class _GalleryViewState extends State<GalleryView>
+    with SingleTickerProviderStateMixin {
   final _scaffoldKey = GlobalKey<ScaffoldState>();
   final _scrollCtrl = ScrollController();
   final List<MediaItem> _items = [];
@@ -45,9 +78,17 @@ class _GalleryViewState extends State<GalleryView> {
   bool _selecting = false;
   final Set<String> _selected = {};
 
+  // 滑选（多选模式下按住拖动）
+  int? _sweepAnchor;
+  bool _sweepAdding = true;
+  Set<String> _sweepBaseline = {};
+
   // 下载进度（仅"逐个下载"模式使用；上传走 UploadManager）
   bool _downloading = false;
+  bool _resolving = false;
   int _downloadCompleted = 0;
+
+  // (unused state removed — floating bar deleted)
   int _downloadTotal = 0;
 
   int? _viewerIndex;
@@ -60,13 +101,19 @@ class _GalleryViewState extends State<GalleryView> {
   final List<({String id, String name})> _folderPath = [];
   List<FolderItem> _folders = [];
 
-  // search
-  bool _searching = false;
+  // search（内嵌在内容顶部，无"搜索模式"状态；有没有在搜由 _searchQuery 决定）
   final _searchCtrl = TextEditingController();
   String _searchQuery = '';
 
-  // pinch-to-zoom grid
-  double _pinchBaseScale = 1.0;
+  // 双指缩放列数：自己数指针，不用 ScaleGestureRecognizer（会被 scroll 抢走）
+  final Set<int> _activePointers = {};
+  final Map<int, Offset> _pointerPos = {};
+  double _pinchStartDist = 0;
+  double _pinchScale = 1.0;
+  // 松手后把新列数从"接上手指离开时的视觉大小"平滑收回 1.0，
+  // 否则重排是一帧硬切，看着很跳
+  late final AnimationController _settleCtrl;
+  double _settleFrom = 1.0;
 
   bool get _hasMore => _nextCursor != null;
 
@@ -74,6 +121,11 @@ class _GalleryViewState extends State<GalleryView> {
   void initState() {
     super.initState();
     _scrollCtrl.addListener(_onScroll);
+    _settleCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 240),
+    )..addListener(() => setState(() {}));
+    if (_embedded) UploadManager.instance.addListener(_onUploadChanged);
   }
 
   @override
@@ -81,7 +133,16 @@ class _GalleryViewState extends State<GalleryView> {
     _scrollCtrl.removeListener(_onScroll);
     _scrollCtrl.dispose();
     _searchCtrl.dispose();
+    _settleCtrl.dispose();
+    if (_embedded) UploadManager.instance.removeListener(_onUploadChanged);
     super.dispose();
+  }
+
+  bool _wasUploading = false;
+  void _onUploadChanged() {
+    final uploading = UploadManager.instance.uploading;
+    if (_wasUploading && !uploading) _refresh();
+    _wasUploading = uploading;
   }
 
   void _onScroll() {
@@ -108,6 +169,7 @@ class _GalleryViewState extends State<GalleryView> {
       _service = MediaService(state);
       _lastPrefs = prefs;
       _reload(prefs);
+      HashSync.instance.syncFromServer();
     } else if (state.status != ConnectionStatus.connected) {
       _service = null;
     }
@@ -116,7 +178,7 @@ class _GalleryViewState extends State<GalleryView> {
   void _onPrefsChanged(DisplayPrefs prefs) {
     _lastPrefs = prefs;
     if (_scrollCtrl.hasClients) {
-      _scrollCtrl.jumpTo(0);
+      _scrollCtrl.jumpTo(_headerScrollExtent);
     }
     _reload(prefs);
   }
@@ -127,7 +189,8 @@ class _GalleryViewState extends State<GalleryView> {
     setState(() => _loading = true);
     try {
       final isSearching = _searchQuery.isNotEmpty;
-      final showFolders = !isSearching && prefs.mediaFilter != MediaFilter.favoritesOnly;
+      final showFolders = widget.mode == GalleryMode.albums
+          && !isSearching && prefs.mediaFilter != MediaFilter.favoritesOnly;
       final futures = <Future>[
         _service!.query(size: 40, filter: _buildFilter(prefs), sort: _buildSort(prefs), withTotal: true),
       ];
@@ -146,6 +209,10 @@ class _GalleryViewState extends State<GalleryView> {
         _folders = folders;
         _loading = false;
       });
+      // 新内容布局完成后再把搜索框滚出视野（此时 maxScrollExtent 才是准的）
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _hideSearchBar();
+      });
     } on ApiException catch (e) {
       if (!mounted || !_reloadSeq.valid(seq)) return;
       setState(() => _loading = false);
@@ -162,7 +229,9 @@ class _GalleryViewState extends State<GalleryView> {
       {'field': 'deleted_at', 'op': 'is_null'},
     ];
 
-    if (_searchQuery.isNotEmpty) {
+    if (widget.mode == GalleryMode.allMedia) {
+      // 跨文件夹查全部，不加 folder_id 条件
+    } else if (_searchQuery.isNotEmpty) {
       conditions.add({'field': 'filename', 'op': 'like', 'value': '%$_searchQuery%'});
     } else if (_currentFolderId == null) {
       conditions.add({'field': 'folder_id', 'op': 'is_null'});
@@ -249,7 +318,9 @@ class _GalleryViewState extends State<GalleryView> {
     _currentFolderId = folder.id;
     _selected.clear();
     _selecting = false;
-    if (_scrollCtrl.hasClients) _scrollCtrl.jumpTo(0);
+    _searchQuery = '';
+    _searchCtrl.clear();
+    if (_scrollCtrl.hasClients) _scrollCtrl.jumpTo(_headerScrollExtent);
     _reload(context.read<DisplayPrefs>());
   }
 
@@ -263,7 +334,9 @@ class _GalleryViewState extends State<GalleryView> {
     }
     _selected.clear();
     _selecting = false;
-    if (_scrollCtrl.hasClients) _scrollCtrl.jumpTo(0);
+    _searchQuery = '';
+    _searchCtrl.clear();
+    if (_scrollCtrl.hasClients) _scrollCtrl.jumpTo(_headerScrollExtent);
     _reload(context.read<DisplayPrefs>());
   }
 
@@ -273,20 +346,64 @@ class _GalleryViewState extends State<GalleryView> {
     _currentFolderId = _folderPath.isEmpty ? null : _folderPath.last.id;
     _selected.clear();
     _selecting = false;
-    if (_scrollCtrl.hasClients) _scrollCtrl.jumpTo(0);
+    _searchQuery = '';
+    _searchCtrl.clear();
+    if (_scrollCtrl.hasClients) _scrollCtrl.jumpTo(_headerScrollExtent);
     _reload(context.read<DisplayPrefs>());
   }
 
-  // ── 搜索 ──
-
-  void _openSearch() {
-    setState(() { _searching = true; _searchQuery = ''; });
-    _searchCtrl.clear();
+  /// 系统返回手势/返回键的唯一处理入口。
+  /// 顺序必须和 PopScope.canPop 枚举的状态一一对应，见那里的注释。
+  void _handleBack() {
+    // 查看器有自己的 PopScope，同一次 pop 两个都会收到回调。
+    // 这里必须**只拦截、不处理** —— 让查看器自己走关闭动画。
+    // 但这个分支不能删：删了会继续往下落到"回上一级"，
+    // 变成"在查看器里按返回，直接退出了当前文件夹"。
+    if (_viewerIndex != null) return;
+    if (_selecting) {
+      _exitSelection();
+      return;
+    }
+    if (_searchQuery.isNotEmpty) {
+      _clearSearch();
+      return;
+    }
+    if (_currentFolderId != null) {
+      _goBack();
+      return;
+    }
+    // canPop 为 true 时系统已经自己 pop 了，走不到这里
   }
 
-  void _closeSearch() {
-    setState(() { _searching = false; _searchQuery = ''; });
+  // ── 内容顶部：面包屑 + 搜索 ──
+  //
+  // 两者都躺在内容里，顶栏不显示任何目录信息 —— 顶栏宽度有限，
+  // 深目录的面包屑放那儿必然被截断看不全。
+  //
+  // 搜索是微信/Apple 式：**默认藏在视野上方**，滚到顶再往下拉一点才露出，
+  // 位置介于内容和刷新指示器之间。靠首帧把滚动位置设到 _headerScrollExtent 实现，
+  // 不是靠隐藏 widget —— 它始终在树里，所以下拉能连续地把它带出来。
+  // 没有"搜索模式"这个状态，有没有在搜索完全由 _searchQuery 是否为空决定。
+
+  /// 搜索框那一段的高度：上下 padding(10+6) + 搜索框(40)。
+  /// 面包屑已移出这里（是固定行），所以不再随目录层级变化。
+  static const double _headerScrollExtent = 0;
+
+  /// 首帧把搜索框滚出视野。列表内容不足一屏时不做（滚不动，做了也白做）。
+  void _hideSearchBar() {
+    if (!_scrollCtrl.hasClients) return;
+    final target = _headerScrollExtent;
+    final pos = _scrollCtrl.position;
+    if (pos.maxScrollExtent < target) return;
+    if (pos.pixels > 0) return;   // 用户已经滚过了，别抢
+    _scrollCtrl.jumpTo(target);
+  }
+
+  void _clearSearch() {
+    if (_searchQuery.isEmpty && _searchCtrl.text.isEmpty) return;
     _searchCtrl.clear();
+    _searchQuery = '';
+    FocusScope.of(context).unfocus();
     _reload(context.read<DisplayPrefs>());
   }
 
@@ -294,7 +411,68 @@ class _GalleryViewState extends State<GalleryView> {
     final q = query.trim();
     if (q == _searchQuery) return;
     _searchQuery = q;
+    FocusScope.of(context).unfocus();
     _reload(context.read<DisplayPrefs>());
+  }
+
+  /// 内容顶部只放搜索框（面包屑是固定行，在 chips 上方，不跟着滚）。
+  /// 多选时整体淡出，但**保留占位**——增删 sliver 会让后面所有内容位移。
+  Widget _buildInlineHeader(AppColors c) {
+    final active = _searchQuery.isNotEmpty;
+    return SliverOpacity(
+      opacity: _selecting ? 0 : 1,
+      sliver: SliverIgnorePointer(
+        ignoring: _selecting,
+        sliver: SliverToBoxAdapter(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 10, 16, 6),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Container(
+                  height: 40,
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  decoration: BoxDecoration(
+                    color: c.surface2,
+                    borderRadius: BorderRadius.circular(AppRadius.pill),
+                  ),
+                  child: Row(children: [
+                    Icon(Icons.search, size: AppIconSize.md, color: c.onMuted),
+                    const SizedBox(width: 8),
+                    Expanded(child: TextField(
+                      controller: _searchCtrl,
+                      style: TextStyle(color: c.onSurface, fontSize: AppType.sm),
+                      decoration: InputDecoration(
+                        hintText: '搜索文件名',
+                        hintStyle: TextStyle(color: c.onMuted, fontSize: AppType.sm),
+                        border: InputBorder.none,
+                        isDense: true,
+                        contentPadding: EdgeInsets.zero,
+                      ),
+                      textInputAction: TextInputAction.search,
+                      onSubmitted: _onSearchSubmit,
+                      // 只为让清除按钮跟着输入出现/消失；不在这里发请求
+                      onChanged: (_) => setState(() {}),
+                    )),
+                    if (active || _searchCtrl.text.isNotEmpty)
+                      GestureDetector(
+                        onTap: _clearSearch,
+                        child: Icon(Icons.cancel, size: AppIconSize.md, color: c.onMuted),
+                      ),
+                  ]),
+                ),
+                if (active)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 10, left: 4),
+                    child: Text('「$_searchQuery」的结果 · $_total 项',
+                        style: TextStyle(color: c.onSurfaceVariant, fontSize: AppType.xs)),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
   }
 
   // ── 文件夹 CRUD ──
@@ -329,9 +507,10 @@ class _GalleryViewState extends State<GalleryView> {
     if (name != null && name.isNotEmpty && mounted) {
       try {
         await _service!.createFolder(name: name, parentId: _currentFolderId);
+        if (mounted) showToast(context, '已创建「$name」', kind: ToastKind.success);
         _refresh();
       } catch (e) {
-        if (mounted) showToast(context, '创建失败: $e');
+        if (mounted) showToast(context, '创建失败: ${errorText(e)}', kind: ToastKind.error);
       }
     }
   }
@@ -356,6 +535,11 @@ class _GalleryViewState extends State<GalleryView> {
             onTap: () { Navigator.pop(ctx); _renameFolder(folder); },
           ),
           ListTile(
+            leading: Icon(Icons.drive_file_move_outlined, color: c.onSurfaceVariant),
+            title: Text('移动文件夹', style: TextStyle(color: c.onSurface)),
+            onTap: () { Navigator.pop(ctx); _moveFolder(folder); },
+          ),
+          ListTile(
             leading: Icon(Icons.delete_outline, color: c.error),
             title: Text('删除文件夹', style: TextStyle(color: c.error)),
             onTap: () { Navigator.pop(ctx); _deleteFolderConfirm(folder); },
@@ -364,6 +548,19 @@ class _GalleryViewState extends State<GalleryView> {
         ]),
       ),
     );
+  }
+
+  Future<void> _moveFolder(FolderItem folder) async {
+    if (_service == null) return;
+    final targetId = await _showFolderPicker(excludeFolderId: folder.id);
+    if (targetId == null || !mounted) return;
+    try {
+      await _service!.moveFolder(folder.id, parentId: targetId.isEmpty ? null : targetId);
+      if (mounted) showToast(context, '已移动文件夹「${folder.name}」', kind: ToastKind.success);
+      _refresh();
+    } catch (e) {
+      if (mounted) showToast(context, '移动失败: ${errorText(e)}', kind: ToastKind.error);
+    }
   }
 
   Future<void> _renameFolder(FolderItem folder) async {
@@ -396,9 +593,10 @@ class _GalleryViewState extends State<GalleryView> {
     if (name != null && name.isNotEmpty && mounted) {
       try {
         await _service!.renameFolder(folder.id, name);
+        if (mounted) showToast(context, '已重命名', kind: ToastKind.success);
         _refresh();
       } catch (e) {
-        if (mounted) showToast(context, '重命名失败: $e');
+        if (mounted) showToast(context, '重命名失败: ${errorText(e)}', kind: ToastKind.error);
       }
     }
   }
@@ -412,9 +610,10 @@ class _GalleryViewState extends State<GalleryView> {
     if (!confirmed || !mounted) return;
     try {
       await _service!.deleteFolder(folder.id);
+      if (mounted) showToast(context, '已删除文件夹', kind: ToastKind.success);
       _refresh();
     } catch (e) {
-      if (mounted) showToast(context, '删除失败: $e');
+      if (mounted) showToast(context, '删除失败: ${errorText(e)}', kind: ToastKind.error);
     }
   }
 
@@ -424,19 +623,46 @@ class _GalleryViewState extends State<GalleryView> {
     if (targetId == null || !mounted) return;
     try {
       await _service!.batchMove(_selected.toList(), folderId: targetId.isEmpty ? null : targetId);
-      showToast(context, '已移动 ${_selected.length} 个文件');
+      showToast(context, '已移动 ${_selected.length} 个文件', kind: ToastKind.success);
       _exitSelection();
       _refresh();
     } catch (e) {
-      if (mounted) showToast(context, '移动失败: $e');
+      if (mounted) showToast(context, '移动失败: ${errorText(e)}', kind: ToastKind.error);
     }
   }
 
-  Future<String?> _showFolderPicker() async {
+  Future<String?> _showFolderPicker({String? excludeFolderId}) async {
     if (_service == null) return null;
-    return showDialog<String>(
+    final c = context.colors;
+    final picker = FolderPickerSheet(
+      service: _service!,
+      currentFolderId: _currentFolderId,
+      excludeFolderId: excludeFolderId,
+    );
+    if (_isDesktop) {
+      return showDialog<String>(
+        context: context,
+        builder: (ctx) => Dialog(
+          backgroundColor: c.bg,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(AppRadius.sheet)),
+          child: SizedBox(width: 380, height: 480, child: picker),
+        ),
+      );
+    }
+    return showModalBottomSheet<String>(
       context: context,
-      builder: (ctx) => FolderPickerDialog(service: _service!, currentFolderId: _currentFolderId),
+      backgroundColor: c.bg,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(AppRadius.sheet)),
+      ),
+      builder: (ctx) => DraggableScrollableSheet(
+        expand: false,
+        initialChildSize: 0.7,
+        maxChildSize: 0.9,
+        minChildSize: 0.4,
+        builder: (ctx, _) => picker,
+      ),
     );
   }
 
@@ -451,6 +677,7 @@ class _GalleryViewState extends State<GalleryView> {
         _selected.add(id);
       }
     });
+    _syncSelection();
   }
 
   bool get _allSelected =>
@@ -470,6 +697,7 @@ class _GalleryViewState extends State<GalleryView> {
         _selected.addAll(_items.map((e) => e.id));
       }
     });
+    _syncSelection();
   }
 
   void _toggleGroupSelect(GalleryGroup group) {
@@ -481,10 +709,52 @@ class _GalleryViewState extends State<GalleryView> {
         _selected.addAll(groupIds);
       }
     });
+    _syncSelection();
   }
 
   void _exitSelection() {
     setState(() { _selecting = false; _selected.clear(); });
+    _syncSelection();
+  }
+
+  // ── 滑选（多选模式下按住拖动，命中判定见 drag_select.dart）──
+
+  bool _sweepStart(int index) {
+    if (index < 0 || index >= _items.length) return false;
+    _sweepAnchor = index;
+    _sweepAdding = !_selected.contains(_items[index].id);
+    _sweepBaseline = Set<String>.from(_selected);
+    setState(() {
+      if (_sweepAdding) {
+        _selected.add(_items[index].id);
+      } else {
+        _selected.remove(_items[index].id);
+      }
+    });
+    return true;
+  }
+
+  void _sweepTo(int index) {
+    final anchor = _sweepAnchor;
+    if (anchor == null) return;
+    if (index < 0 || index >= _items.length) return;
+    final lo = anchor < index ? anchor : index;
+    final hi = anchor < index ? index : anchor;
+    setState(() {
+      // 区间外还原到按下前的状态，区间内整段应用 —— 回拖能正确取消
+      for (var i = 0; i < _items.length; i++) {
+        final id = _items[i].id;
+        final on = (i >= lo && i <= hi) ? _sweepAdding : _sweepBaseline.contains(id);
+        if (on) { _selected.add(id); } else { _selected.remove(id); }
+      }
+    });
+  }
+
+  void _sweepEnd() {
+    _sweepAnchor = null;
+    _sweepBaseline = {};
+    if (_selected.isEmpty && _selecting) setState(() => _selecting = false);
+    _syncSelection();
   }
 
   Future<void> _favoriteSelected() async {
@@ -508,7 +778,7 @@ class _GalleryViewState extends State<GalleryView> {
         _refresh();
       }
     } on ApiException catch (e) {
-      if (mounted) showToast(context, '操作失败: ${e.userMessage}', kind: ToastKind.error);
+      if (mounted) showToast(context, '操作失败: ${e.displayMessage}', kind: ToastKind.error);
     }
   }
 
@@ -519,9 +789,17 @@ class _GalleryViewState extends State<GalleryView> {
         message: '确定删除选中的 ${_selected.length} 个文件？',
         confirmLabel: '删除', destructive: true);
     if (!confirmed || !mounted) return;
-    await _service!.batchDelete(_selected.toList());
-    _exitSelection();
-    await _refresh();
+    final count = _selected.length;
+    try {
+      await _service!.batchDelete(_selected.toList());
+      if (mounted) showToast(context, '已删除 $count 个文件', kind: ToastKind.success);
+      _exitSelection();
+      await _refresh();
+    } on ApiException catch (e) {
+      if (mounted) showToast(context, '删除失败: ${e.displayMessage}', kind: ToastKind.error);
+    } catch (_) {
+      if (mounted) showToast(context, '删除失败', kind: ToastKind.error);
+    }
   }
 
   Future<void> _downloadSelected() async {
@@ -553,12 +831,18 @@ class _GalleryViewState extends State<GalleryView> {
 
     if (choice == _DownloadMode.zip) {
       try {
-        final savePath = await DownloadService.instance.pickSavePath('igallery.zip');
-        if (savePath == null || !mounted) return; // 用户取消
+        final dir = await DownloadService.instance.pickSaveDir();
+        if (dir == null || !mounted) return; // 用户取消
+        // 已存在同名 zip 就换个名，别把用户上次下的包盖掉
+        final savePath = uniqueFile(dir.path, 'igallery.zip').path;
         await _service!.downloadBatch(_selected.toList(), savePath: savePath);
-        if (mounted) { showToast(context, '已下载为 zip', kind: ToastKind.success); _exitSelection(); }
+        if (mounted) {
+          final name = savePath.split(Platform.pathSeparator).last;
+          showToast(context, '已下载为 $name', kind: ToastKind.success);
+          _exitSelection();
+        }
       } on ApiException catch (e) {
-        if (mounted) showToast(context, '下载失败: ${e.userMessage}', kind: ToastKind.error);
+        if (mounted) showToast(context, '下载失败: ${e.displayMessage}', kind: ToastKind.error);
       } catch (_) {
         if (mounted) showToast(context, '下载失败', kind: ToastKind.error);
       }
@@ -567,17 +851,28 @@ class _GalleryViewState extends State<GalleryView> {
       if (dir == null || !mounted) return; // 用户取消
       setState(() { _downloading = true; _downloadCompleted = 0; _downloadTotal = count; });
       try {
-        await _service!.downloadIndividual(
+        final report = await _service!.downloadIndividual(
           _selected.toList(),
           saveDir: dir.path,
           onProgress: (c, t) {
             if (mounted) setState(() { _downloadCompleted = c; _downloadTotal = t; });
           },
         );
-        if (mounted) { showToast(context, '已下载 $count 个文件', kind: ToastKind.success); _exitSelection(); }
+        if (mounted) {
+          // 如实汇报成功/失败数，不再一律"已下载 N 个"
+          if (report.failed == 0) {
+            showToast(context, '已下载 ${report.ok} 个文件', kind: ToastKind.success);
+          } else if (report.ok == 0) {
+            showToast(context, '下载失败（${report.failed} 个）', kind: ToastKind.error);
+          } else {
+            showToast(context, '已下载 ${report.ok} 个，${report.failed} 个失败',
+                kind: ToastKind.error);
+          }
+          if (report.ok > 0) _exitSelection();
+        }
       } on ApiException catch (e) {
-        if (mounted) showToast(context, '下载失败: ${e.userMessage}', kind: ToastKind.error);
-      } catch (e) {
+        if (mounted) showToast(context, '下载失败: ${e.displayMessage}', kind: ToastKind.error);
+      } catch (_) {
         if (mounted) showToast(context, '下载失败', kind: ToastKind.error);
       } finally {
         if (mounted) setState(() => _downloading = false);
@@ -587,29 +882,30 @@ class _GalleryViewState extends State<GalleryView> {
 
   // ── 上传 ──
 
-  Future<void> _pickAndUpload() async {
+  Future<void> _pickAndUpload({bool fromFiles = false}) async {
     if (_service == null) return;
     if (UploadManager.instance.uploading) {
       showToast(context, '正在上传中，请稍候', kind: ToastKind.info);
       return;
     }
-    final List<PlatformFile> picked;
-    if (_isDesktop) {
-      picked = await FilePicker.pickFiles(
-        type: FileType.custom,
-        allowedExtensions: [
-          'jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'heif',
-          'mp4', 'mov', 'avi', 'mkv',
-        ],
-      );
+    final List<PendingUpload> files;
+    if (_isDesktop || fromFiles) {
+      // 桌面 / 移动端"从文件":任意类型,交由服务端判断能否入库
+      final picked = await FilePicker.pickFiles(type: FileType.any);
+      files = picked
+          .where((f) => f.path != null)
+          .map((f) => PendingUpload(File(f.path!)))
+          .toList();
     } else {
-      picked = await FilePicker.pickFiles(type: FileType.media);
+      // 移动端"从相册":photo_manager 拿到 AssetEntity.createDateTime
+      final result = await Navigator.of(context).push<List<PendingUpload>>(
+        MaterialPageRoute(builder: (_) => const MediaPickerPage()),
+      );
+      files = result ?? [];
     }
-    final files = picked
-        .where((f) => f.path != null)
-        .map((f) => File(f.path!))
-        .toList();
     if (files.isEmpty || !mounted) return;
+
+    setState(() => _resolving = true);
 
     final serverUrl = context.read<ServerState>().baseUrl;
     final result = await UploadManager.instance.enqueue(
@@ -617,25 +913,159 @@ class _GalleryViewState extends State<GalleryView> {
       folderId: _currentFolderId,
       serverUrl: serverUrl,
     );
+    if (mounted && _resolving) setState(() => _resolving = false);
 
     if (mounted) {
       final parts = <String>['已上传 ${result.uploaded} 个'];
       if (result.dedup > 0) parts.add('${result.dedup} 个已存在跳过');
       if (result.failed > 0) parts.add('${result.failed} 个失败');
+      if (result.cancelled > 0) parts.add('${result.cancelled} 个已取消');
       showToast(context, parts.join(' · '),
-          kind: result.failed > 0 ? ToastKind.error : ToastKind.success);
+          kind: result.allOk ? ToastKind.success : ToastKind.error);
       _refresh();
     }
+  }
+
+  /// 移动端上传入口:弹出"从相册 / 从文件"二选一。
+  /// 相册走 photo_manager,拿得到拍摄时间和多选滑动;
+  /// 文件走 SAF/Files,覆盖非相册目录、微信下载、第三方 app 存的文件。
+  Future<void> _showUploadSourceSheet() async {
+    if (_isDesktop) { _pickAndUpload(); return; }
+    final c = context.colors;
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: c.bg,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(AppRadius.sheet)),
+      ),
+      builder: (ctx) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          const SheetHandle(),
+          ListTile(
+            leading: Icon(Icons.photo_library_outlined, color: c.onSurface),
+            title: Text('从相册选择',
+                style: TextStyle(color: c.onSurface, fontSize: AppType.sm)),
+            subtitle: Text('图片和视频,可多选',
+                style: TextStyle(color: c.onMuted, fontSize: AppType.xxs)),
+            onTap: () => Navigator.pop(ctx, 'album'),
+          ),
+          ListTile(
+            leading: Icon(Icons.folder_open_outlined, color: c.onSurface),
+            title: Text('从文件选择',
+                style: TextStyle(color: c.onSurface, fontSize: AppType.sm)),
+            subtitle: Text('任意目录、任意格式',
+                style: TextStyle(color: c.onMuted, fontSize: AppType.xxs)),
+            onTap: () => Navigator.pop(ctx, 'files'),
+          ),
+          const SizedBox(height: 8),
+        ]),
+      ),
+    );
+    if (choice == 'album') _pickAndUpload();
+    if (choice == 'files') _pickAndUpload(fromFiles: true);
   }
 
   void _openUploadHistory() {
     Navigator.of(context).push(MaterialPageRoute(builder: (_) => const UploadHistoryPage()));
   }
 
+  // ── 桌面右键菜单 ──
+
+  void _showGridContextMenu(Offset pos, AppColors c) {
+    showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(pos.dx, pos.dy, pos.dx, pos.dy),
+      color: c.surface,
+      items: [
+        PopupMenuItem(value: 'new_folder', child: Row(children: [
+          Icon(Icons.create_new_folder_outlined, size: 18, color: c.onSurfaceVariant),
+          const SizedBox(width: 12),
+          Text('新建文件夹', style: TextStyle(color: c.onSurface, fontSize: AppType.sm)),
+        ])),
+        PopupMenuItem(value: 'refresh', child: Row(children: [
+          Icon(Icons.refresh, size: 18, color: c.onSurfaceVariant),
+          const SizedBox(width: 12),
+          Text('刷新', style: TextStyle(color: c.onSurface, fontSize: AppType.sm)),
+        ])),
+        PopupMenuItem(value: 'upload', child: Row(children: [
+          Icon(Icons.upload_rounded, size: 18, color: c.onSurfaceVariant),
+          const SizedBox(width: 12),
+          Text('上传', style: TextStyle(color: c.onSurface, fontSize: AppType.sm)),
+        ])),
+      ],
+    ).then((v) {
+      if (v == 'new_folder') _createFolder();
+      if (v == 'refresh') _refresh();
+      if (v == 'upload') _showUploadSourceSheet();
+    });
+  }
+
+  void _showItemContextMenu(Offset pos, MediaItem item, AppColors c) {
+    showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(pos.dx, pos.dy, pos.dx, pos.dy),
+      color: c.surface,
+      items: [
+        PopupMenuItem(value: 'open', child: Row(children: [
+          Icon(Icons.open_in_new, size: 18, color: c.onSurfaceVariant),
+          const SizedBox(width: 12),
+          Text('打开', style: TextStyle(color: c.onSurface, fontSize: AppType.sm)),
+        ])),
+        PopupMenuItem(value: 'favorite', child: Row(children: [
+          Icon(item.isFavorite ? Icons.favorite : Icons.favorite_border, size: 18,
+              color: item.isFavorite ? c.onSurface : c.onSurfaceVariant),
+          const SizedBox(width: 12),
+          Text(item.isFavorite ? '取消收藏' : '收藏', style: TextStyle(color: c.onSurface, fontSize: AppType.sm)),
+        ])),
+        PopupMenuItem(value: 'move', child: Row(children: [
+          Icon(Icons.drive_file_move_outlined, size: 18, color: c.onSurfaceVariant),
+          const SizedBox(width: 12),
+          Text('移动', style: TextStyle(color: c.onSurface, fontSize: AppType.sm)),
+        ])),
+        PopupMenuItem(value: 'delete', child: Row(children: [
+          Icon(Icons.delete_outline, size: 18, color: c.error),
+          const SizedBox(width: 12),
+          Text('删除', style: TextStyle(color: c.error, fontSize: AppType.sm)),
+        ])),
+      ],
+    ).then((v) async {
+      if (v == 'open') {
+        _openViewer(_items.indexOf(item));
+      } else if (v == 'favorite') {
+        try {
+          final target = !item.isFavorite;
+          await _service!.batchFavorite([item.id], favorite: target);
+          final idx = _items.indexWhere((m) => m.id == item.id);
+          if (idx >= 0) _items[idx] = _items[idx].copyWith(favorite: target ? 1 : 0);
+          if (mounted) { setState(() {}); showToast(context, target ? '已收藏' : '已取消收藏', kind: ToastKind.success); }
+        } on ApiException catch (e) {
+          if (mounted) showToast(context, '操作失败: ${e.displayMessage}', kind: ToastKind.error);
+        }
+      } else if (v == 'move') {
+        _selected.clear(); _selected.add(item.id); _selecting = true;
+        _moveSelected();
+      } else if (v == 'delete') {
+        final ok = await appConfirmDialog(context, title: '删除', message: '确定删除 ${item.filename}？', confirmLabel: '删除', destructive: true);
+        if (!ok || !mounted) return;
+        try {
+          await _service!.delete(item.id);
+          if (mounted) showToast(context, '已删除 ${item.filename}', kind: ToastKind.success);
+          _refresh();
+        } on ApiException catch (e) {
+          if (mounted) showToast(context, '删除失败: ${e.displayMessage}', kind: ToastKind.error);
+        } catch (_) {
+          if (mounted) showToast(context, '删除失败', kind: ToastKind.error);
+        }
+      }
+    });
+  }
+
   // ── 导航 ──
 
   void _openProfile() {
-    if (_isDesktop) {
+    if (_embedded) {
+      widget.shell!.switchToTab(2);
+    } else if (_isDesktop) {
       _scaffoldKey.currentState?.openDrawer();
     } else {
       Navigator.of(context).push(
@@ -662,16 +1092,65 @@ class _GalleryViewState extends State<GalleryView> {
 
   // ── build ──
 
+  bool get _embedded => widget.shell != null;
+
+  void _openViewer(int index) {
+    if (_embedded && _service != null) {
+      widget.shell!.openViewer(
+        items: _items,
+        index: index,
+        service: _service!,
+        onDeleted: (id) => setState(() {
+          _items.removeWhere((m) => m.id == id);
+        }),
+      );
+    } else {
+      setState(() => _viewerIndex = index);
+    }
+  }
+
+  void _syncSelection() {
+    if (!_embedded) return;
+    widget.shell!.updateSelection(
+      selecting: _selecting,
+      selectedIds: _selected,
+      allSelected: _allSelected,
+      allFavorite: _selectedAllFavorite,
+      onToggleSelectAll: _toggleSelectAll,
+      onFavorite: _favoriteSelected,
+      onMove: _moveSelected,
+      onDownload: _downloadSelected,
+      onDelete: _deleteSelected,
+      onExitSelection: _exitSelection,
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final c = context.colors;
     final state = context.watch<ServerState>();
     final prefs = context.watch<DisplayPrefs>();
 
-    return PopScope(
-      canPop: _currentFolderId == null,
+    // 移动端嵌入 shell：只渲染内容区域，不包 Scaffold
+    if (_embedded) return _buildContent(c, state, prefs);
+
+    // 桌面端：完整 Scaffold（保持原有行为）
+    return AnnotatedRegion<SystemUiOverlayStyle>(
+      value: SystemUiOverlayStyle(
+        statusBarColor: c.bg,
+        statusBarIconBrightness: Brightness.dark,
+        statusBarBrightness: Brightness.light,
+        systemNavigationBarColor: c.bg,
+        systemNavigationBarIconBrightness: Brightness.dark,
+      ),
+      child: PopScope(
+      canPop: _viewerIndex == null
+          && !_selecting
+          && _searchQuery.isEmpty
+          && _currentFolderId == null,
       onPopInvokedWithResult: (didPop, _) {
-        if (!didPop) _goBack();
+        if (didPop) return;
+        _handleBack();
       },
       child: Scaffold(
       key: _scaffoldKey,
@@ -681,8 +1160,8 @@ class _GalleryViewState extends State<GalleryView> {
       floatingActionButton: _showScrollTop && _viewerIndex == null
           ? FloatingActionButton.small(
               onPressed: () {
-                _scrollCtrl.animateTo(0, duration: const Duration(milliseconds: 300), curve: Curves.easeOut);
-                _refresh();
+                _scrollCtrl.animateTo(_headerScrollExtent,
+                    duration: const Duration(milliseconds: 300), curve: Curves.easeOut);
               },
               backgroundColor: c.surface2,
               foregroundColor: c.onSurface,
@@ -698,16 +1177,7 @@ class _GalleryViewState extends State<GalleryView> {
       body: Stack(
         fit: StackFit.expand,
         children: [
-          Column(
-            children: [
-              _buildToolbar(c, state, prefs),
-              if (state.status == ConnectionStatus.connected && !_searching)
-                _buildFilterChips(c, prefs),
-              UploadBar(onTap: _openUploadHistory),
-              if (_downloading) _buildDownloadBar(c),
-              Expanded(child: _buildBody(c, state, prefs)),
-            ],
-          ),
+          _buildContent(c, state, prefs),
           if (_viewerIndex != null && _service != null)
             MediaViewer(
               items: _items,
@@ -721,9 +1191,30 @@ class _GalleryViewState extends State<GalleryView> {
                 });
               },
             ),
+          if (_resolving)
+            _UploadOverlay(
+              onHide: () => setState(() => _resolving = false),
+            ),
         ],
       ),
     ),
+    ),
+    );
+  }
+
+  Widget _buildContent(AppColors c, ServerState state, DisplayPrefs prefs) {
+    return Column(
+      children: [
+        _buildToolbar(c, state, prefs),
+        if (state.status == ConnectionStatus.connected)
+          IgnorePointer(
+            ignoring: _selecting,
+            child: Opacity(opacity: _selecting ? 0.35 : 1, child: _buildFilterChips(c, prefs)),
+          ),
+        if (!_embedded) UploadBar(onTap: _openUploadHistory),
+        if (_downloading) _buildDownloadBar(c),
+        Expanded(child: _buildBody(c, state, prefs)),
+      ],
     );
   }
 
@@ -739,7 +1230,7 @@ class _GalleryViewState extends State<GalleryView> {
         child: Column(
           children: [
             Container(
-              height: 52,
+              height: 64,
               padding: const EdgeInsets.symmetric(horizontal: 16),
               child: Row(
                 children: [
@@ -770,7 +1261,7 @@ class _GalleryViewState extends State<GalleryView> {
         child: Column(
           children: [
             Container(
-              height: 52,
+              height: 64,
               padding: const EdgeInsets.symmetric(horizontal: 16),
               child: Row(
                 children: [
@@ -796,101 +1287,55 @@ class _GalleryViewState extends State<GalleryView> {
 
   Widget _buildToolbar(AppColors c, ServerState state, DisplayPrefs prefs) {
     final connected = state.status == ConnectionStatus.connected;
-    final inFolder = _currentFolderId != null;
-
-    if (_searching) {
-      return Container(
-        height: 52,
-        padding: const EdgeInsets.symmetric(horizontal: 6),
-        decoration: BoxDecoration(
-          border: Border(bottom: BorderSide(color: c.outline, width: 0.5)),
-        ),
-        child: Row(children: [
-          IconButton(
-            onPressed: _closeSearch,
-            icon: Icon(Icons.arrow_back, size: AppIconSize.lg, color: c.onSurface),
-          ),
-          Expanded(child: TextField(
-            controller: _searchCtrl,
-            autofocus: true,
-            style: TextStyle(color: c.onSurface, fontSize: AppType.sm),
-            decoration: InputDecoration(
-              hintText: '搜索文件名…',
-              hintStyle: TextStyle(color: c.onMuted, fontSize: AppType.sm),
-              border: InputBorder.none,
-              isDense: true,
-              contentPadding: const EdgeInsets.symmetric(vertical: 8),
-            ),
-            textInputAction: TextInputAction.search,
-            onSubmitted: _onSearchSubmit,
-            onChanged: (q) {
-              if (q.isEmpty && _searchQuery.isNotEmpty) _onSearchSubmit('');
-            },
-          )),
-          IconButton(
-            onPressed: () {
-              if (_searchCtrl.text.isNotEmpty) {
-                _searchCtrl.clear();
-                _onSearchSubmit('');
-              } else {
-                _closeSearch();
-              }
-            },
-            icon: Icon(Icons.close, size: AppIconSize.lg, color: c.onSurfaceVariant),
-          ),
-        ]),
-      );
-    }
 
     return Container(
-      height: 52,
+      height: 64,
       padding: const EdgeInsets.symmetric(horizontal: 6),
       decoration: BoxDecoration(
         border: Border(bottom: BorderSide(color: c.outline, width: 0.5)),
       ),
       child: Row(
         children: [
-          if (inFolder) ...[
+          if (_selecting)
             IconButton(
-              onPressed: _goBack,
-              icon: Icon(Icons.arrow_back, size: AppIconSize.lg, color: c.onSurface),
-              tooltip: '返回',
-            ),
-            Expanded(child: _buildBreadcrumb(c)),
+              onPressed: _exitSelection,
+              icon: Icon(Icons.close_rounded, size: AppIconSize.lg, color: c.onSurface),
+              tooltip: '退出多选',
+            )
+          else if (_embedded)
+            _buildServerLabel(c, state)
+          else
+            _buildAvatar(c, state),
+          if (_selecting) ...[
+            Text('已选 ${_selected.length}',
+                style: TextStyle(color: c.onSurface, fontSize: AppType.sm, fontWeight: FontWeight.w600)),
+            const Spacer(),
           ] else ...[
-            IconButton(
-              onPressed: _openProfile,
-              icon: Icon(Icons.menu, size: AppIconSize.lg, color: c.onSurface),
-              tooltip: '设置',
-            ),
-            if (!connected)
+            if (_currentFolderId != null && widget.mode == GalleryMode.albums)
+              Flexible(flex: 0, child: _buildToolbarPath(c)),
+            if (!connected && !_embedded)
               Text(state.status == ConnectionStatus.needAuth ? '需令牌' : '未连接',
                   style: TextStyle(
                     color: state.status == ConnectionStatus.needAuth ? c.warn : c.onMuted,
                     fontSize: AppType.xs)),
-            if (connected && _total > 0)
+            if (connected && _currentFolderId == null && _total > 0)
               Text('$_total', style: TextStyle(color: c.onMuted, fontSize: AppType.xs)),
             const Spacer(),
           ],
 
-          if (_selecting) ...[
-            TextButton(
-              onPressed: _toggleSelectAll,
-              style: TextButton.styleFrom(
-                padding: const EdgeInsets.symmetric(horizontal: 10),
-                minimumSize: Size.zero,
-                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-              ),
-              child: Text(_allSelected ? '取消全选' : '全选',
-                  style: TextStyle(color: c.brand, fontSize: AppType.xs, fontWeight: FontWeight.w600)),
-            ),
-            Text('${_selected.length}',
-                style: TextStyle(color: c.onSurface, fontSize: AppType.sm, fontWeight: FontWeight.w600)),
+          // 选择态右侧按钮：桌面端在顶栏显示全部操作，移动端操作在 shell 底部条
+          if (_selecting && _isDesktop) ...[
+            IconButton(onPressed: _toggleSelectAll,
+                icon: Icon(
+                  _allSelected ? Icons.deselect : Icons.select_all,
+                  size: AppIconSize.lg,
+                  color: _allSelected ? c.brand : c.onSurfaceVariant,
+                ), tooltip: _allSelected ? '取消全选' : '全选'),
             IconButton(onPressed: _favoriteSelected,
                 icon: Icon(
-                  _selectedAllFavorite ? Icons.star : Icons.star_border,
+                  _selectedAllFavorite ? Icons.favorite : Icons.favorite_border,
                   size: AppIconSize.lg,
-                  color: _selectedAllFavorite ? c.warn : c.onSurfaceVariant,
+                  color: _selectedAllFavorite ? c.onSurface : c.onSurfaceVariant,
                 ), tooltip: _selectedAllFavorite ? '取消收藏' : '收藏'),
             IconButton(onPressed: _moveSelected,
                 icon: Icon(Icons.drive_file_move_outlined, size: AppIconSize.lg, color: c.onSurfaceVariant), tooltip: '移动'),
@@ -898,21 +1343,20 @@ class _GalleryViewState extends State<GalleryView> {
                 icon: Icon(Icons.file_download_outlined, size: AppIconSize.lg, color: c.onSurfaceVariant), tooltip: '下载'),
             IconButton(onPressed: _deleteSelected,
                 icon: Icon(Icons.delete_outline, size: AppIconSize.lg, color: c.error), tooltip: '删除'),
-            IconButton(onPressed: _exitSelection,
-                icon: Icon(Icons.close_rounded, size: AppIconSize.lg, color: c.onSurfaceVariant), tooltip: '取消'),
-          ] else ...[
-            if (connected)
-              IconButton(onPressed: _openSearch,
-                  icon: Icon(Icons.search, size: AppIconSize.lg, color: c.onSurfaceVariant), tooltip: '搜索'),
-            if (connected && _items.isNotEmpty)
-              IconButton(onPressed: () => setState(() => _selecting = true),
-                  icon: Icon(Icons.library_add_check_outlined, size: AppIconSize.lg, color: c.onSurfaceVariant), tooltip: '多选'),
-            if (connected)
+          ] else if (!_selecting) ...[
+            if (_isDesktop && connected && _items.isNotEmpty)
+              IconButton(onPressed: () {
+                setState(() => _selecting = true);
+                _syncSelection();
+              }, icon: Icon(Icons.library_add_check_outlined, size: AppIconSize.lg, color: c.onSurfaceVariant), tooltip: '多选'),
+            if (connected && widget.mode == GalleryMode.albums)
               IconButton(onPressed: _createFolder,
                   icon: Icon(Icons.create_new_folder_outlined, size: AppIconSize.lg, color: c.onSurfaceVariant), tooltip: '新建文件夹'),
-            if (connected)
+            if (connected && widget.mode == GalleryMode.albums)
               IconButton(
-                  onPressed: _pickAndUpload,
+                  onPressed: _embedded
+                      ? () => widget.shell!.pickAndUpload(folderId: _currentFolderId)
+                      : _showUploadSourceSheet,
                   icon: Icon(Icons.upload_rounded, size: AppIconSize.lg,
                       color: c.onSurfaceVariant), tooltip: '上传'),
             IconButton(
@@ -932,23 +1376,23 @@ class _GalleryViewState extends State<GalleryView> {
     );
   }
 
-  // ── 顶栏下筛选 chips（全部/图片/视频/收藏）──
+  // ── 顶栏下筛选 chips（YouTube 移动端风格）──
   Widget _buildFilterChips(AppColors c, DisplayPrefs prefs) {
-    const options = <(MediaFilter, String, IconData?)>[
-      (MediaFilter.all, '全部', null),
-      (MediaFilter.photosOnly, '图片', null),
-      (MediaFilter.videosOnly, '视频', null),
-      (MediaFilter.favoritesOnly, '收藏', null),
+    const options = <(MediaFilter, String)>[
+      (MediaFilter.all, '全部'),
+      (MediaFilter.photosOnly, '图片'),
+      (MediaFilter.videosOnly, '视频'),
+      (MediaFilter.favoritesOnly, '收藏'),
     ];
     return SizedBox(
-      height: 44,
+      height: 52,
       child: ListView.separated(
         scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.symmetric(horizontal: 12),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
         itemCount: options.length,
-        separatorBuilder: (_, __) => const SizedBox(width: 8),
+        separatorBuilder: (_, __) => const SizedBox(width: 10),
         itemBuilder: (ctx, i) {
-          final (filter, label, _) = options[i];
+          final (filter, label) = options[i];
           final active = prefs.mediaFilter == filter;
           return GestureDetector(
             onTap: active
@@ -959,33 +1403,19 @@ class _GalleryViewState extends State<GalleryView> {
                   },
             child: Container(
               alignment: Alignment.center,
-              padding: const EdgeInsets.symmetric(horizontal: 14),
+              height: 36,
+              padding: const EdgeInsets.symmetric(horizontal: 16),
               decoration: BoxDecoration(
-                color: active ? c.brandSoft : c.surface2,
-                borderRadius: BorderRadius.circular(AppRadius.pill),
-                border: Border.all(
-                  color: active ? c.brand : Colors.transparent,
-                  width: 0.5,
-                ),
+                color: active ? c.onSurface : c.surface2,
+                borderRadius: BorderRadius.circular(AppRadius.chip),
               ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  if (filter == MediaFilter.favoritesOnly) ...[
-                    Icon(active ? Icons.star : Icons.star_border,
-                        size: AppIconSize.sm,
-                        color: active ? c.brand : c.onSurfaceVariant),
-                    const SizedBox(width: 4),
-                  ],
-                  Text(
-                    label,
-                    style: TextStyle(
-                      color: active ? c.brand : c.onSurfaceVariant,
-                      fontSize: AppType.sm,
-                      fontWeight: active ? FontWeight.w600 : FontWeight.w500,
-                    ),
-                  ),
-                ],
+              child: Text(
+                label,
+                style: TextStyle(
+                  color: active ? c.bg : c.onSurface,
+                  fontSize: AppType.sm,
+                  fontWeight: FontWeight.w600,
+                ),
               ),
             ),
           );
@@ -994,34 +1424,133 @@ class _GalleryViewState extends State<GalleryView> {
     );
   }
 
-  Widget _buildBreadcrumb(AppColors c) {
-    return SingleChildScrollView(
-      scrollDirection: Axis.horizontal,
-      child: Row(
-        children: [
-          GestureDetector(
-            onTap: () => _navigateToPathIndex(-1),
-            child: Text('首页', style: TextStyle(color: c.brand, fontSize: AppType.xs)),
+  /// 顶栏里的路径，紧挨设置图标。两种形态：
+  ///  - 1 层：`首页 / 相册名`，两段都可点
+  ///  - 2 层以上：`… / 当前层`，点 `…` 弹出中间各层的下拉菜单
+  ///
+  /// 之所以不平铺所有层：顶栏宽度有限，深目录平铺必然挤掉右侧操作按钮
+  /// 或被截断。折叠成一个 `…` 是 Finder / VS Code 面包屑的通用做法。
+  /// 左上角头像 → 全局设置。
+  /// 取当前服务器名首字，底色跟连接状态走 —— 顺带当状态指示，
+  /// 不用再单独占一个位置显示"未连接/需令牌"。
+  Widget _buildAvatar(AppColors c, ServerState state) {
+    final name = state.active?.name.trim() ?? '';
+    return IconButton(
+      onPressed: _openProfile,
+      tooltip: name.isEmpty ? '设置' : '$name · 设置',
+      icon: Icon(Icons.person_outline,
+          size: AppIconSize.lg, color: c.onSurfaceVariant),
+    );
+  }
+
+  Widget _buildServerLabel(AppColors c, ServerState state) {
+    final connected = state.status == ConnectionStatus.connected;
+    final needAuth = state.status == ConnectionStatus.needAuth;
+    final name = state.active?.name.trim() ?? '';
+    final dotColor = connected ? c.ok : (needAuth ? c.warn : c.error);
+    final label = connected
+        ? (name.isEmpty ? '已连接' : name)
+        : (needAuth ? '需令牌' : '未连接');
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 10),
+      child: Row(mainAxisSize: MainAxisSize.min, children: [
+        Container(
+          width: 8, height: 8,
+          decoration: BoxDecoration(color: dotColor, shape: BoxShape.circle),
+        ),
+        const SizedBox(width: 6),
+        ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 120),
+          child: Text(label,
+              maxLines: 1, overflow: TextOverflow.ellipsis,
+              style: TextStyle(color: c.onSurface, fontSize: AppType.sm, fontWeight: FontWeight.w600)),
+        ),
+      ]),
+    );
+  }
+
+  Widget _buildToolbarPath(AppColors c) {
+    final last = _folderPath.length - 1;
+    final style = TextStyle(
+      color: c.onSurfaceVariant,
+      fontSize: AppType.sm,
+      height: 1.2,
+    );
+    final sep = Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 5),
+      child: Text('/', style: style.copyWith(color: c.onMuted)),
+    );
+
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.baseline,
+      textBaseline: TextBaseline.alphabetic,
+      children: [
+        if (_folderPath.length == 1)
+          _pathSegment('首页', style, () => _navigateToPathIndex(-1))
+        else
+          _buildPathMenu(c, style),
+        sep,
+        // 当前层：跟其它段用同一样式,不再加粗/加深
+        Flexible(
+          child: Text(
+            _folderPath[last].name,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: style,
           ),
-          for (var i = 0; i < _folderPath.length; i++) ...[
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 4),
-              child: Icon(Icons.chevron_right, size: 14, color: c.onMuted),
-            ),
-            GestureDetector(
-              onTap: i < _folderPath.length - 1 ? () => _navigateToPathIndex(i) : null,
-              child: Text(
-                _folderPath[i].name,
-                style: TextStyle(
-                  color: i < _folderPath.length - 1 ? c.brand : c.onSurface,
-                  fontSize: AppType.xs,
-                  fontWeight: i == _folderPath.length - 1 ? FontWeight.w600 : FontWeight.normal,
-                ),
-              ),
-            ),
-          ],
-        ],
+        ),
+      ],
+    );
+  }
+
+  /// 折叠态的 `…`：点开列出 首页 + 所有中间层
+  Widget _buildPathMenu(AppColors c, TextStyle style) {
+    return PopupMenuButton<int>(
+      tooltip: '上级目录',
+      color: c.surface,
+      position: PopupMenuPosition.under,
+      padding: EdgeInsets.zero,
+      onSelected: _navigateToPathIndex,
+      itemBuilder: (_) => [
+        PopupMenuItem(value: -1, child: Row(children: [
+          Icon(Icons.home_outlined, size: AppIconSize.md, color: c.onSurfaceVariant),
+          const SizedBox(width: 10),
+          Text('首页', style: TextStyle(color: c.onSurface, fontSize: AppType.sm)),
+        ])),
+        // 不含最后一层 —— 那是当前所在层，已经显示在右边了
+        for (var i = 0; i < _folderPath.length - 1; i++)
+          PopupMenuItem(value: i, child: Padding(
+            // 逐级缩进，一眼看出层级关系
+            padding: EdgeInsets.only(left: 12.0 * (i + 1)),
+            child: Row(children: [
+              Icon(Icons.subdirectory_arrow_right, size: AppIconSize.sm, color: c.onMuted),
+              const SizedBox(width: 8),
+              Flexible(child: Text(_folderPath[i].name,
+                  maxLines: 1, overflow: TextOverflow.ellipsis,
+                  style: TextStyle(color: c.onSurface, fontSize: AppType.sm))),
+            ]),
+          )),
+      ],
+      child: Padding(
+        // PopupMenuButton 默认有 48px 最小点击区，会把 `…` 撑得很宽。
+        // 这里自己给一个够用的点击面积，不让它顶开右边的操作按钮。
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
+        child: Text('…', style: style.copyWith(
+          color: c.onSurfaceVariant,
+          fontSize: AppType.mdPlus,
+          fontWeight: FontWeight.w600,
+        )),
       ),
+    );
+  }
+
+  Widget _pathSegment(String label, TextStyle style, VoidCallback onTap) {
+    return GestureDetector(
+      onTap: onTap,
+      behavior: HitTestBehavior.opaque,
+      child: Text(label, maxLines: 1, overflow: TextOverflow.ellipsis, style: style),
     );
   }
 
@@ -1059,50 +1588,88 @@ class _GalleryViewState extends State<GalleryView> {
             message: prefs.hasActiveFilter ? '没有匹配的项目' : '还没有照片',
             action: prefs.hasActiveFilter
                 ? AppButton(label: '清除筛选', onTap: () { prefs.clearFilters(); _refresh(); }, primary: false)
-                : AppButton(label: '上传照片', icon: Icons.add, onTap: _pickAndUpload),
+                : widget.mode == GalleryMode.albums
+                    ? AppButton(label: '上传照片', icon: Icons.add, onTap: _embedded
+                        ? () => widget.shell!.pickAndUpload(folderId: _currentFolderId)
+                        : _showUploadSourceSheet)
+                    : null,
           ),
         ]),
       );
     }
 
     final groups = buildGroups(_items, prefs);
+    // 滑选要全局下标（groups 是 _items 的有序分区）
+    final indexOfId = <String, int>{
+      for (var i = 0; i < _items.length; i++) _items[i].id: i,
+    };
 
     return GestureDetector(
-      onScaleStart: (_) => _pinchBaseScale = 1.0,
-      onScaleUpdate: (d) {
-        if (d.pointerCount < 2) return;
-        final delta = d.scale / _pinchBaseScale;
-        if (delta > 1.3) { prefs.pinchZoomTransient(1.5); _pinchBaseScale = d.scale; }
-        else if (delta < 0.7) { prefs.pinchZoomTransient(0.5); _pinchBaseScale = d.scale; }
+      // 到这里已经过了上面的未连接早退，必然是 connected
+      onSecondaryTapDown: _isDesktop ? (d) => _showGridContextMenu(d.globalPosition, c) : null,
+      child: Listener(
+      // 自己数指针，而不是靠 ScaleGestureRecognizer：后者要和 ScrollView 的
+      // VerticalDrag 抢竞技场，drag 经常先赢 —— 体感就是"双指缩放变成了上下滚动"。
+      // 数到 2 指就把 physics 换成 NeverScrollable，scroll 直接退出竞争。
+      onPointerDown: (e) {
+        _activePointers.add(e.pointer);
+        _pointerPos[e.pointer] = e.position;
+        if (_activePointers.length == 2) {
+          _pinchStartDist = _pointerDistance();
+          setState(() => _pinchScale = 1.0);
+        }
       },
-      onScaleEnd: (_) => prefs.pinchZoomCommit(),
+      onPointerMove: (e) {
+        _pointerPos[e.pointer] = e.position;
+        if (_activePointers.length >= 2 && _pinchStartDist > 0) {
+          final d = _pointerDistance();
+          if (d > 0) setState(() => _pinchScale = d / _pinchStartDist);
+        }
+      },
+      onPointerUp: (e) => _endPinch(e.pointer, prefs),
+      onPointerCancel: (e) => _endPinch(e.pointer, prefs),
+      child: ScrollConfiguration(
+      behavior: ScrollConfiguration.of(context).copyWith(
+        physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
+      ),
       child: RefreshIndicator(
       onRefresh: _refresh, color: c.brand,
       notificationPredicate: (_) => true,
-      child: CustomScrollView(
+      child: DragSelectDetector(
+        enabled: _selecting,
+        onStart: _sweepStart,
+        onEnter: _sweepTo,
+        onEnd: _sweepEnd,
+        scrollController: _scrollCtrl,
+        child: LayoutBuilder(builder: (ctx, box) {
+        // 格子高 = 列宽 + 标签高。用实测列宽算，不写死 childAspectRatio ——
+        // 写死的比例在列宽或标签行数变化时会让标签放不下（RenderFlex overflowed）。
+        const gridPad = 16.0, crossGap = 14.0;
+        final usable = box.maxWidth - gridPad * 2;
+        final mediaCol = (usable - crossGap * (prefs.gridColumns - 1)) / prefs.gridColumns;
+        final mediaLabel = labelExtent(prefs);
+        final mediaRatio = mediaCol / (mediaCol + mediaLabel);
+
+        // 文件夹网格走 maxCrossAxisExtent，列数由框架算，这里复现同一套规则
+        final folderCols = (usable / 150).ceil().clamp(1, 99);
+        final folderCol = (usable - crossGap * (folderCols - 1)) / folderCols;
+        final folderRatio = folderCol / (folderCol + folderLabelExtent);
+
+        return _pinchWrap(CustomScrollView(
         controller: _scrollCtrl,
-        physics: const AlwaysScrollableScrollPhysics(),
+        physics: _pinching
+            ? const NeverScrollableScrollPhysics()
+            : const AlwaysScrollableScrollPhysics(),
         slivers: [
-          // folders section
-          if (_folders.isNotEmpty) ...[
-            SliverToBoxAdapter(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(12, 16, 12, 8),
-                child: Text('文件夹',
-                    style: TextStyle(color: c.onSurface, fontSize: AppType.mdPlus, fontWeight: FontWeight.w700)),
-              ),
-            ),
-            SliverPadding(
-              padding: const EdgeInsets.symmetric(horizontal: 12),
-              sliver: SliverGrid(
-                gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-                  maxCrossAxisExtent: 130,
-                  mainAxisSpacing: 12, crossAxisSpacing: 10,
-                  childAspectRatio: 0.86,
-                ),
+          // 搜索框已移到独立搜索 tab，这里不再渲染
+          if (_folders.isNotEmpty && widget.mode == GalleryMode.albums) ...[
+            SliverList(
                 delegate: SliverChildBuilderDelegate(
-                  (ctx, i) => FolderThumb(
-                    folder: _folders[i],
+                  (ctx, i) => _FolderListTile(
+                    key: ValueKey(_folders[i].id),
+                    name: _folders[i].name,
+                    coverId: _folders[i].coverId,
+                    itemCount: _folders[i].itemCount,
                     service: _service!,
                     onTap: () => _enterFolder(_folders[i]),
                     onLongPress: () => _showFolderActions(_folders[i]),
@@ -1110,7 +1677,8 @@ class _GalleryViewState extends State<GalleryView> {
                   childCount: _folders.length,
                 ),
               ),
-            ),
+            if (_folders.isNotEmpty && _items.isNotEmpty)
+              SliverToBoxAdapter(child: Divider(height: 1, color: c.outline)),
           ],
           // media section
           for (final group in groups) ...[
@@ -1120,16 +1688,17 @@ class _GalleryViewState extends State<GalleryView> {
                   behavior: _selecting ? HitTestBehavior.opaque : HitTestBehavior.deferToChild,
                   onTap: _selecting ? () => _toggleGroupSelect(group) : null,
                   child: Padding(
-                    padding: const EdgeInsets.fromLTRB(12, 18, 12, 8),
+                    padding: const EdgeInsets.fromLTRB(16, 32, 16, 14),
                     child: Row(children: [
                       Text(group.label,
-                          style: TextStyle(color: c.onSurface, fontSize: AppType.mdPlus, fontWeight: FontWeight.w700)),
+                          style: TextStyle(color: c.onSurface, fontSize: AppType.mdPlus,
+                              fontWeight: FontWeight.w700, letterSpacing: -0.3)),
                       const Spacer(),
                       if (_selecting)
                         Icon(
                           group.items.every((m) => _selected.contains(m.id))
                               ? Icons.check_box : Icons.check_box_outline_blank,
-                          size: 18,
+                          size: AppIconSize.lg,
                           color: group.items.every((m) => _selected.contains(m.id))
                               ? c.brand : c.onMuted,
                         ),
@@ -1138,26 +1707,33 @@ class _GalleryViewState extends State<GalleryView> {
                 ),
               ),
             SliverPadding(
-              padding: const EdgeInsets.symmetric(horizontal: 12),
+              padding: const EdgeInsets.symmetric(horizontal: 16),
               sliver: SliverGrid(
                 gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
                   crossAxisCount: prefs.gridColumns,
-                  mainAxisSpacing: 12, crossAxisSpacing: 10,
-                  childAspectRatio: prefs.labelPosition == LabelPosition.below && prefs.hasLabel ? 0.76 : 1.0,
+                  mainAxisSpacing: 16, crossAxisSpacing: crossGap,
+                  childAspectRatio: mediaRatio,
                 ),
                 delegate: SliverChildBuilderDelegate(
-                  (ctx, i) => MediaThumb(
+                  (ctx, i) => DragSelectItem(
+                    index: indexOfId[group.items[i].id] ?? -1,
+                    child: MediaThumb(
+                    key: ValueKey(group.items[i].id),
                     item: group.items[i], service: _service!,
                     selected: _selected.contains(group.items[i].id),
                     selecting: _selecting, prefs: prefs,
                     onTap: () {
                       if (_selecting) { _toggleSelect(group.items[i].id); }
-                      else { setState(() => _viewerIndex = _items.indexOf(group.items[i])); }
+                      else { _openViewer(_items.indexOf(group.items[i])); }
                     },
                     onLongPress: () {
                       if (!_selecting) setState(() => _selecting = true);
-                      _toggleSelect(group.items[i].id);
+                      _toggleSelect(group.items[i].id); // _syncSelection called inside
                     },
+                    onSecondaryTap: _isDesktop && !_selecting
+                        ? (pos) => _showItemContextMenu(pos, group.items[i], c)
+                        : null,
+                    ),
                   ),
                   childCount: group.items.length,
                 ),
@@ -1183,17 +1759,268 @@ class _GalleryViewState extends State<GalleryView> {
               child: Center(child: Text('已加载全部 $_total 项',
                   style: TextStyle(color: c.onMuted, fontSize: AppType.xs))),
             )),
-          const SliverToBoxAdapter(child: SizedBox(height: 24)),
+          SliverToBoxAdapter(child: SizedBox(height: _isDesktop ? 24 : 88)),
         ],
+      ));
+      }),
       ),
     ),
+    ),
+    ),
     );
+  }
+
+  // ── 双指缩放列数 ──
+
+  bool get _pinching => _activePointers.length >= 2;
+
+  /// 缩放中：整棵网格做视觉缩放，**不动列数**。
+  /// 过程中就改列数的话每跨一档都要重建整棵网格，手感是一顿一顿的。
+  /// 松手后：列数已经换成新的，从 `_settleFrom` 平滑收回 1.0 接上手感。
+  ///
+  /// 注意**永远**返回 Transform.scale，不做 `if (idle) return child` 的短路：
+  /// 那样会让 child 的父节点在缩放前后变化，element 被卸载重建 ——
+  /// 滚动位置丢失、所有 CachedThumb 状态清零（缩略图变空白）。
+  /// scale == 1.0 时 Transform 本身没有可观测开销。
+  Widget _pinchWrap(Widget child) {
+    final double scale;
+    if (_pinching) {
+      scale = _pinchScale.clamp(0.5, 2.0);
+    } else if (_settleCtrl.isAnimating) {
+      scale = _settleFrom + (1.0 - _settleFrom) * Curves.easeOutCubic
+          .transform(_settleCtrl.value);
+    } else {
+      scale = 1.0;
+    }
+    return Transform.scale(
+      scale: scale,
+      filterQuality: FilterQuality.low,
+      child: child,
+    );
+  }
+
+  double _pointerDistance() {
+    final pts = _activePointers
+        .map((p) => _pointerPos[p])
+        .whereType<Offset>()
+        .toList();
+    if (pts.length < 2) return 0;
+    return (pts[0] - pts[1]).distance;
+  }
+
+  void _endPinch(int pointer, DisplayPrefs prefs) {
+    final wasPinching = _pinching;
+    _activePointers.remove(pointer);
+    _pointerPos.remove(pointer);
+    // 只在从"2 指"掉到"少于 2 指"的那一刻定档
+    if (!wasPinching || _pinching) return;
+
+    final s = _pinchScale;
+    final oldCols = prefs.gridColumns;
+    _pinchStartDist = 0;
+    _pinchScale = 1.0;
+
+    final newCols = s > 1.25
+        ? (oldCols - 1).clamp(1, 6)
+        : s < 0.8
+            ? (oldCols + 1).clamp(1, 6)
+            : oldCols;
+
+    if (newCols == oldCols) {
+      // 没跨档：直接弹回原状
+      _settleFrom = s;
+      _settleCtrl.forward(from: 0);
+      return;
+    }
+
+    // 跨了档。新布局的格子比旧布局大 oldCols/newCols 倍，
+    // 想在切换那一帧视觉上接住手指离开时的大小，新布局得先按
+    // s * newCols / oldCols 画，再动画收回 1.0。
+    _settleFrom = (s * newCols / oldCols).clamp(0.5, 2.0);
+    prefs.setGridColumns(newCols);
+    _settleCtrl.forward(from: 0);
   }
 }
 
 // ── 下载模式 ──
 
 enum _DownloadMode { direct, zip }
+
+// ── 相册列表行 ──
+
+class _FolderListTile extends StatelessWidget {
+  final String name;
+  final String? coverId;
+  final int? itemCount;
+  final IconData? icon;
+  final String? subtitle;
+  final MediaService service;
+  final VoidCallback onTap;
+  final VoidCallback? onLongPress;
+
+  const _FolderListTile({
+    super.key,
+    required this.name,
+    this.coverId,
+    this.itemCount,
+    this.icon,
+    this.subtitle,
+    required this.service,
+    required this.onTap,
+    this.onLongPress,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.colors;
+    return InkWell(
+      onTap: onTap,
+      onLongPress: onLongPress,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        child: Row(children: [
+          // 封面缩略图或图标
+          ClipRRect(
+            borderRadius: BorderRadius.circular(AppRadius.card),
+            child: SizedBox(
+              width: 60, height: 60,
+              child: coverId != null
+                  ? CachedThumb(
+                      id: coverId!,
+                      url: service.thumbUrl(coverId!),
+                      headers: service.authHeaders,
+                    )
+                  : Container(
+                      color: c.surface2,
+                      child: Icon(icon ?? Icons.folder_outlined,
+                          color: c.onMuted, size: AppIconSize.xl),
+                    ),
+            ),
+          ),
+          const SizedBox(width: 14),
+          // 名称 + 子标题
+          Expanded(child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(name,
+                  maxLines: 1, overflow: TextOverflow.ellipsis,
+                  style: TextStyle(color: c.onSurface, fontSize: AppType.sm, fontWeight: FontWeight.w500)),
+              const SizedBox(height: 2),
+              Text(subtitle ?? (itemCount != null ? '$itemCount 项' : ''),
+                  style: TextStyle(color: c.onMuted, fontSize: AppType.xs)),
+            ],
+          )),
+          Icon(Icons.chevron_right, color: c.onMuted, size: AppIconSize.lg),
+        ]),
+      ),
+    );
+  }
+}
+
+// ── 上传遮罩 ──
+
+class _UploadOverlay extends StatefulWidget {
+  final VoidCallback onHide;
+  const _UploadOverlay({required this.onHide});
+
+  @override
+  State<_UploadOverlay> createState() => _UploadOverlayState();
+}
+
+class _UploadOverlayState extends State<_UploadOverlay> {
+  @override
+  void initState() {
+    super.initState();
+    UploadManager.instance.addListener(_onChange);
+  }
+
+  @override
+  void dispose() {
+    UploadManager.instance.removeListener(_onChange);
+    super.dispose();
+  }
+
+  void _onChange() { if (mounted) setState(() {}); }
+
+  String _fmtBytes(double bytes) {
+    if (bytes < 1024) return '${bytes.toStringAsFixed(0)} B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    if (bytes < 1024 * 1024 * 1024) return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
+  }
+
+  String _fmtEta(Duration d) {
+    if (d.inHours > 0) return '${d.inHours}h${d.inMinutes.remainder(60)}m';
+    if (d.inMinutes > 0) return '${d.inMinutes}m${d.inSeconds.remainder(60)}s';
+    return '${d.inSeconds}s';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.colors;
+    final m = UploadManager.instance;
+    final uploading = m.uploading;
+    final progress = m.progress;
+    final speed = m.speedBps;
+    final eta = m.eta;
+
+    return Positioned.fill(child: GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () {},
+      child: ColoredBox(
+        color: c.scrimSoft,
+        child: Center(child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              width: 56, height: 56,
+              child: CircularProgressIndicator(
+                value: uploading ? progress.clamp(0, 1).toDouble() : null,
+                strokeWidth: 4,
+                color: c.brand,
+                backgroundColor: c.outline,
+              ),
+            ),
+            const SizedBox(height: 16),
+            if (!uploading)
+              Text('正在准备上传…',
+                style: TextStyle(color: c.onSurfaceVariant, fontSize: AppType.sm))
+            else ...[
+              Text('${m.completed}/${m.total}  ${(progress * 100).toStringAsFixed(0)}%',
+                style: TextStyle(color: c.onSurface, fontSize: AppType.mdPlus, fontWeight: FontWeight.w600)),
+              const SizedBox(height: 4),
+              if (speed > 0)
+                Text('${_fmtBytes(speed)}/s${eta != null ? '  ETA ${_fmtEta(eta)}' : ''}',
+                  style: TextStyle(color: c.onMuted, fontSize: AppType.xs)),
+              const SizedBox(height: 20),
+              Row(mainAxisSize: MainAxisSize.min, children: [
+                OutlinedButton(
+                  onPressed: m.cancelling ? null : m.cancel,
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: c.error,
+                    side: BorderSide(color: c.error.withValues(alpha: 0.5)),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(AppRadius.chip)),
+                  ),
+                  child: Text(m.cancelling ? '正在取消…' : '取消上传'),
+                ),
+                const SizedBox(width: 12),
+                FilledButton(
+                  onPressed: widget.onHide,
+                  style: FilledButton.styleFrom(
+                    backgroundColor: c.brand,
+                    foregroundColor: c.onScrim,
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(AppRadius.chip)),
+                  ),
+                  child: const Text('后台上传'),
+                ),
+              ]),
+            ],
+          ],
+        )),
+      ),
+    ));
+  }
+}
 
 // ── 分组：见 gallery_groups.dart ──
 

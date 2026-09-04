@@ -23,13 +23,16 @@ class KvStore {
     final dbPath = p.join(await getDatabasesPath(), 'igallery_prefs.db');
     _db = await openDatabase(
       dbPath,
-      version: 2,
+      version: 3,
       onCreate: (db, _) async {
         await _createSchema(db);
       },
       onUpgrade: (db, oldV, newV) async {
         if (oldV < 2) {
           await _createUploadHistory(db);
+        }
+        if (oldV < 3) {
+          await _createUploadedHashes(db);
         }
       },
     );
@@ -38,6 +41,7 @@ class KvStore {
   static Future<void> _createSchema(Database db) async {
     await db.execute('CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)');
     await _createUploadHistory(db);
+    await _createUploadedHashes(db);
   }
 
   static Future<void> _createUploadHistory(Database db) async {
@@ -56,6 +60,14 @@ class KvStore {
       )
     ''');
     await db.execute('CREATE INDEX IF NOT EXISTS idx_upload_started ON upload_history(started_at DESC)');
+  }
+
+  static Future<void> _createUploadedHashes(Database db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS uploaded_hashes (
+        checksum TEXT PRIMARY KEY
+      )
+    ''');
   }
 
   Future<String?> get(String key) async {

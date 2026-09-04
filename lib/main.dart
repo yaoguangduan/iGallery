@@ -11,7 +11,10 @@ import 'core/discovery_service.dart';
 import 'core/disk_cache.dart';
 import 'core/display_prefs.dart';
 import 'core/kv_store.dart';
+import 'core/log_service.dart';
 import 'core/server_state.dart';
+import 'core/hash_sync.dart';
+import 'core/upload_history.dart';
 import 'theme/app_theme.dart';
 
 Future<void> main() async {
@@ -23,10 +26,13 @@ Future<void> main() async {
       FlutterError.presentError(details);
       dev.log('Flutter error: ${details.exceptionAsString()}',
           error: details.exception, stackTrace: details.stack);
+      LogService.instance.error('Flutter: ${details.exceptionAsString()}',
+          error: details.exception, stack: details.stack);
     };
 
     PlatformDispatcher.instance.onError = (error, stack) {
       dev.log('Uncaught error: $error', error: error, stackTrace: stack);
+      LogService.instance.error('Uncaught: $error', error: error, stack: stack);
       return true;
     };
 
@@ -34,6 +40,11 @@ Future<void> main() async {
 
     await KvStore.instance.init();
     await DiskCache.instance.init();
+    await LogService.instance.init();
+    // 上次进程被杀时遗留的 "进行中" 记录标成中断，
+    // 否则用户会一直看到永远转圈的假记录
+    await UploadHistory.markStalePending();
+    await HashSync.instance.loadLocal();
 
     final displayPrefs = DisplayPrefs();
     await displayPrefs.load();
@@ -41,7 +52,9 @@ Future<void> main() async {
     final serverState = ServerState();
     DiscoveryService.instance.attach(serverState);
     unawaited(DiscoveryService.instance.start());
-    unawaited(serverState.tryLocalhost());
+    // 恢复上次手动添加/连接过的服务器（落盘在 KvStore），再退回 localhost。
+    // 不这样做的话，更新/重启 app 后手动加的服务器就全丢了。
+    unawaited(serverState.bootstrap());
 
     runApp(
       MultiProvider(
@@ -54,6 +67,7 @@ Future<void> main() async {
     );
   }, (error, stack) {
     dev.log('Zone error: $error', error: error, stackTrace: stack);
+    LogService.instance.error('Zone: $error', error: error, stack: stack);
   });
 }
 

@@ -6,8 +6,8 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tokio::fs;
+use xxhash_rust::xxh3::Xxh3;
 use tokio::io::AsyncWriteExt;
 use tower_http::services::ServeFile;
 use tower::ServiceExt;
@@ -265,7 +265,7 @@ async fn stream_upload(
 
     let mut file = fs::File::create(&media_path).await
         .map_err(|e| format!("create: {e}"))?;
-    let mut hasher = Sha256::new();
+    let mut hasher = Xxh3::new();
     let mut total_size: u64 = 0;
     let mut interrupted = false;
     let mut interrupt_reason = String::new();
@@ -297,7 +297,7 @@ async fn stream_upload(
         return Err(interrupt_reason);
     }
 
-    let checksum = format!("{:x}", hasher.finalize());
+    let checksum = format!("{:032x}", hasher.digest128());
 
     // 去重
     if let Ok(Some(existing)) = db::find_by_checksum(&state.pool, &checksum).await {
@@ -346,8 +346,13 @@ async fn stream_upload(
         if taken_at.is_none() { taken_at = meta.taken_at; }
     }
 
-    // 4. 最弱兜底：客户端文件修改时间
+    // 4. 兜底：客户端文件修改时间
     if taken_at.is_none() { taken_at = normalize_ts(mtime_fallback); }
+
+    // 5. 最后一道保险：所有渠道都失败时用"现在"。绝不入库 NULL，
+    // 否则排序 NULLS LAST 会让它永远沉在列表最底 —— 用户体验就是
+    // "今天新上传的照片跑到最下面"，历史 NULL 行也永远看不见。
+    if taken_at.is_none() { taken_at = Some(now_rfc3339()); }
 
     finalize_row(state, id, safe_filename, ext, content_type, media_type,
         total_size, w, h, duration, exif.orientation.map(|v| v as i32),
@@ -458,6 +463,39 @@ pub async fn batch_favorite(
     match db::set_favorite_many(&state.pool, &body.ids, body.favorite).await {
         Ok(n) => Json(serde_json::json!({"updated": n})).into_response(),
         Err(e) => { tracing::error!("batch_favorite: {e}"); StatusCode::INTERNAL_SERVER_ERROR.into_response() }
+    }
+}
+
+// ── GET /v1/media/checksums — 全量 hash 列表（客户端同步用） ──
+
+pub async fn list_checksums(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    match db::list_all_checksums(&state.pool).await {
+        Ok(list) => Json(serde_json::json!({"checksums": list})).into_response(),
+        Err(e) => { tracing::error!("list_checksums: {e}"); StatusCode::INTERNAL_SERVER_ERROR.into_response() }
+    }
+}
+
+// ── POST /v1/media/check-hashes — 批量查哪些 hash 已存在 ──
+
+#[derive(Deserialize)]
+pub struct CheckHashesReq { pub checksums: Vec<String> }
+
+pub async fn check_hashes(
+    State(state): State<AppState>,
+    Json(body): Json<CheckHashesReq>,
+) -> impl IntoResponse {
+    match db::list_all_checksums(&state.pool).await {
+        Ok(all) => {
+            let set: std::collections::HashSet<&str> = all.iter().map(|s| s.as_str()).collect();
+            let exists: Vec<&str> = body.checksums.iter()
+                .filter(|c| set.contains(c.as_str()))
+                .map(|c| c.as_str())
+                .collect();
+            Json(serde_json::json!({"exists": exists})).into_response()
+        }
+        Err(e) => { tracing::error!("check_hashes: {e}"); StatusCode::INTERNAL_SERVER_ERROR.into_response() }
     }
 }
 

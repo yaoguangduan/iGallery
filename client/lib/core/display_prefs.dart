@@ -2,11 +2,17 @@ import 'package:flutter/foundation.dart';
 import 'kv_store.dart';
 
 enum LabelPosition { none, overlay, below }
+
 enum SortField { takenAt, createdAt, size, filename }
+
 enum SortOrder { desc, asc }
+
 enum MediaFilter { all, photosOnly, videosOnly, favoritesOnly }
+
 enum GroupMode { day, month, year, none }
+
 enum GridDensity { small, medium, large } // kept for settings migration
+
 enum ViewerTransition { fade, scale, none }
 
 class DisplayPrefs extends ChangeNotifier {
@@ -51,15 +57,17 @@ class DisplayPrefs extends ChangeNotifier {
   ViewerTransition get viewerTransition => _viewerTransition;
 
   double get thumbMaxExtent => switch (_gridDensity) {
-        GridDensity.small => 90,
-        GridDensity.medium => 130,
-        GridDensity.large => 200,
-      };
+    GridDensity.small => 90,
+    GridDensity.medium => 130,
+    GridDensity.large => 200,
+  };
 
   bool get hasActiveFilter =>
       _mediaFilter != MediaFilter.all ||
-      _minSize != null || _maxSize != null ||
-      _dateFrom != null || _dateTo != null;
+      _minSize != null ||
+      _maxSize != null ||
+      _dateFrom != null ||
+      _dateTo != null;
 
   // ── 持久化 ──
 
@@ -70,64 +78,153 @@ class DisplayPrefs extends ChangeNotifier {
     _showSize = kv['showSize'] != '0';
     _showDimensions = kv['showDimensions'] == '1';
     _showCamera = kv['showCamera'] == '1';
-    _labelPosition = _enumFromStr(LabelPosition.values, kv['labelPosition']) ?? LabelPosition.below;
-    _sortField = _enumFromStr(SortField.values, kv['sortField']) ?? SortField.takenAt;
-    _sortOrder = _enumFromStr(SortOrder.values, kv['sortOrder']) ?? SortOrder.desc;
-    _mediaFilter = _enumFromStr(MediaFilter.values, kv['mediaFilter']) ?? MediaFilter.all;
+    _labelPosition =
+        _enumFromStr(LabelPosition.values, kv['labelPosition']) ??
+        LabelPosition.below;
+    _sortField =
+        _enumFromStr(SortField.values, kv['sortField']) ?? SortField.takenAt;
+    _sortOrder =
+        _enumFromStr(SortOrder.values, kv['sortOrder']) ?? SortOrder.desc;
+    _mediaFilter =
+        _enumFromStr(MediaFilter.values, kv['mediaFilter']) ?? MediaFilter.all;
     _minSize = kv['minSize'] != null ? int.tryParse(kv['minSize']!) : null;
     _maxSize = kv['maxSize'] != null ? int.tryParse(kv['maxSize']!) : null;
-    _dateFrom = kv['dateFrom'] != null ? DateTime.tryParse(kv['dateFrom']!) : null;
+    _dateFrom = kv['dateFrom'] != null
+        ? DateTime.tryParse(kv['dateFrom']!)
+        : null;
     _dateTo = kv['dateTo'] != null ? DateTime.tryParse(kv['dateTo']!) : null;
-    _groupMode = _enumFromStr(GroupMode.values, kv['groupMode']) ?? GroupMode.day;
-    _gridDensity = _enumFromStr(GridDensity.values, kv['gridDensity']) ?? GridDensity.medium;
+    _groupMode =
+        _enumFromStr(GroupMode.values, kv['groupMode']) ?? GroupMode.day;
+    _gridDensity =
+        _enumFromStr(GridDensity.values, kv['gridDensity']) ??
+        GridDensity.medium;
     _gridColumns = int.tryParse(kv['gridColumns'] ?? '') ?? 4;
-    _viewerTransition = _enumFromStr(ViewerTransition.values, kv['viewerTransition']) ?? ViewerTransition.fade;
+    _viewerTransition =
+        _enumFromStr(ViewerTransition.values, kv['viewerTransition']) ??
+        ViewerTransition.fade;
     notifyListeners();
   }
 
   T? _enumFromStr<T extends Enum>(List<T> values, String? s) {
     if (s == null) return null;
-    for (final v in values) { if (v.name == s) return v; }
+    for (final v in values) {
+      if (v.name == s) return v;
+    }
     return null;
   }
 
   void _save(String key, String value) => KvStore.instance.set(key, value);
   void _saveBool(String key, bool v) => _save(key, v ? '1' : '0');
   void _saveNullInt(String key, int? v) {
-    if (v == null) { KvStore.instance.set(key, ''); } else { _save(key, '$v'); }
+    if (v == null) {
+      KvStore.instance.set(key, '');
+    } else {
+      _save(key, '$v');
+    }
   }
 
   // setters (每个都持久化)
-  void setShowName(bool v) { _showName = v; _saveBool('showName', v); notifyListeners(); }
-  void setShowTime(bool v) { _showTime = v; _saveBool('showTime', v); notifyListeners(); }
-  void setShowSize(bool v) { _showSize = v; _saveBool('showSize', v); notifyListeners(); }
-  void setShowDimensions(bool v) { _showDimensions = v; _saveBool('showDimensions', v); notifyListeners(); }
-  void setShowCamera(bool v) { _showCamera = v; _saveBool('showCamera', v); notifyListeners(); }
-  void setLabelPosition(LabelPosition v) { _labelPosition = v; _save('labelPosition', v.name); notifyListeners(); }
-  void setSortField(SortField v) { _sortField = v; _save('sortField', v.name); notifyListeners(); }
-  void setSortOrder(SortOrder v) { _sortOrder = v; _save('sortOrder', v.name); notifyListeners(); }
-  void setMediaFilter(MediaFilter v) { _mediaFilter = v; _save('mediaFilter', v.name); notifyListeners(); }
-  void setMinSize(int? v) { _minSize = v; _saveNullInt('minSize', v); notifyListeners(); }
-  void setMaxSize(int? v) { _maxSize = v; _saveNullInt('maxSize', v); notifyListeners(); }
-  void setDateFrom(DateTime? v) { _dateFrom = v; _save('dateFrom', v?.toIso8601String() ?? ''); notifyListeners(); }
-  void setDateTo(DateTime? v) { _dateTo = v; _save('dateTo', v?.toIso8601String() ?? ''); notifyListeners(); }
-  void setGroupMode(GroupMode v) { _groupMode = v; _save('groupMode', v.name); notifyListeners(); }
-  void setGridDensity(GridDensity v) { _gridDensity = v; _save('gridDensity', v.name); notifyListeners(); }
-  void setGridColumns(int v) { _gridColumns = v.clamp(1, 6); _save('gridColumns', '$_gridColumns'); notifyListeners(); }
-  void setViewerTransition(ViewerTransition v) { _viewerTransition = v; _save('viewerTransition', v.name); notifyListeners(); }
+  void setShowName(bool v) {
+    _showName = v;
+    _saveBool('showName', v);
+    notifyListeners();
+  }
 
-  void toggleSortOrder() {
-    _sortOrder = _sortOrder == SortOrder.desc ? SortOrder.asc : SortOrder.desc;
-    _save('sortOrder', _sortOrder.name);
+  void setShowTime(bool v) {
+    _showTime = v;
+    _saveBool('showTime', v);
+    notifyListeners();
+  }
+
+  void setShowSize(bool v) {
+    _showSize = v;
+    _saveBool('showSize', v);
+    notifyListeners();
+  }
+
+  void setShowDimensions(bool v) {
+    _showDimensions = v;
+    _saveBool('showDimensions', v);
+    notifyListeners();
+  }
+
+  void setShowCamera(bool v) {
+    _showCamera = v;
+    _saveBool('showCamera', v);
+    notifyListeners();
+  }
+
+  void setLabelPosition(LabelPosition v) {
+    _labelPosition = v;
+    _save('labelPosition', v.name);
+    notifyListeners();
+  }
+
+  void setSort(SortField field, SortOrder order) {
+    _sortField = field;
+    _sortOrder = order;
+    _save('sortField', field.name);
+    _save('sortOrder', order.name);
+    notifyListeners();
+  }
+
+  void setMediaFilter(MediaFilter v) {
+    _mediaFilter = v;
+    _save('mediaFilter', v.name);
+    notifyListeners();
+  }
+
+  void setSizeRange(int? min, int? max) {
+    _minSize = min;
+    _maxSize = max;
+    _saveNullInt('minSize', min);
+    _saveNullInt('maxSize', max);
+    notifyListeners();
+  }
+
+  void setDateRange(DateTime? from, DateTime? to) {
+    _dateFrom = from;
+    _dateTo = to;
+    _save('dateFrom', from?.toIso8601String() ?? '');
+    _save('dateTo', to?.toIso8601String() ?? '');
+    notifyListeners();
+  }
+
+  void setGroupMode(GroupMode v) {
+    _groupMode = v;
+    _save('groupMode', v.name);
+    notifyListeners();
+  }
+
+  void setGridDensity(GridDensity v) {
+    _gridDensity = v;
+    _save('gridDensity', v.name);
+    notifyListeners();
+  }
+
+  void setGridColumns(int v) {
+    _gridColumns = v.clamp(1, 6);
+    _save('gridColumns', '$_gridColumns');
+    notifyListeners();
+  }
+
+  void setViewerTransition(ViewerTransition v) {
+    _viewerTransition = v;
+    _save('viewerTransition', v.name);
     notifyListeners();
   }
 
   void clearFilters() {
-    _mediaFilter = MediaFilter.all; _save('mediaFilter', 'all');
-    _minSize = null; _saveNullInt('minSize', null);
-    _maxSize = null; _saveNullInt('maxSize', null);
-    _dateFrom = null; _save('dateFrom', '');
-    _dateTo = null; _save('dateTo', '');
+    _mediaFilter = MediaFilter.all;
+    _save('mediaFilter', 'all');
+    _minSize = null;
+    _saveNullInt('minSize', null);
+    _maxSize = null;
+    _saveNullInt('maxSize', null);
+    _dateFrom = null;
+    _save('dateFrom', '');
+    _dateTo = null;
+    _save('dateTo', '');
     notifyListeners();
   }
 }

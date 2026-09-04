@@ -71,8 +71,8 @@ abstract class AppRadius {
 abstract class AppIconSize {
   static const double sm = 16;
   static const double md = 18;
-  static const double lg = 20;
-  static const double xl = 22;
+  static const double lg = 22;
+  static const double xl = 24;
   static const double hero = 32;
 }
 
@@ -86,17 +86,19 @@ abstract class AppSpace {
   static const EdgeInsets card = EdgeInsets.all(lg);
 }
 
+// YouTube 移动端的"大气"来自留白和字号，不是把东西塞紧。
+// 这一档整体比 Material 默认偏大，别为了多塞一行往回调。
 abstract class AppType {
-  static const double xxs = 10.5;
-  static const double xs = 11.5;
-  static const double sm = 13.5;
-  static const double md = 14.5;
-  static const double base = 15;
-  static const double mdPlus = 16;
-  static const double lg = 17;
-  static const double xl = 20;
-  static const double xxl = 24;
-  static const double display = 32;
+  static const double xxs = 11.5;
+  static const double xs = 13;
+  static const double sm = 15;
+  static const double md = 16;
+  static const double base = 16;
+  static const double mdPlus = 19;   // 分组标题 / 页标题
+  static const double lg = 20;
+  static const double xl = 24;
+  static const double xxl = 28;
+  static const double display = 34;
 
   static const List<String> familyFallback = [
     'PingFang SC',

@@ -47,6 +47,8 @@
 			</array>
 		</dict>
 	</dict>
+	<key>NSCameraUsageDescription</key>
+	<string>拍摄照片并上传到相册</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>选择照片和视频上传到 iGallery</string>
 	<key>UIApplicationSupportsIndirectInputEvents</key>

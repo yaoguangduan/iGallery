@@ -133,22 +133,52 @@ pub async fn get_folder(
 // ── PATCH /v1/folders/{id} ──
 
 #[derive(serde::Deserialize)]
-pub struct RenameBody { pub name: String }
+pub struct PatchBody {
+    pub name: Option<String>,
+    pub parent_id: Option<String>,
+}
 
-pub async fn rename_folder(
+pub async fn patch_folder(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(body): Json<RenameBody>,
+    Json(body): Json<PatchBody>,
 ) -> impl IntoResponse {
-    let name = body.name.trim();
-    if name.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "name is required"}))).into_response();
+    if let Some(ref name) = body.name {
+        let name = name.trim();
+        if name.is_empty() {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "name is required"}))).into_response();
+        }
+        match db::rename_folder(&state.pool, &id, name).await {
+            Ok(true) => {}
+            Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+            Err(e) => { tracing::error!("rename_folder: {e}"); return StatusCode::INTERNAL_SERVER_ERROR.into_response(); }
+        }
     }
-    match db::rename_folder(&state.pool, &id, name).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => { tracing::error!("rename_folder: {e}"); StatusCode::INTERNAL_SERVER_ERROR.into_response() }
+    if body.parent_id.is_some() {
+        // "" means root (null parent_id), non-empty means a target folder
+        let target = body.parent_id.as_deref().filter(|s| !s.is_empty());
+        if let Some(pid) = target {
+            if pid == id {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "不能移动到自身"}))).into_response();
+            }
+            match db::get_folder(&state.pool, pid).await {
+                Ok(None) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "目标文件夹不存在"}))).into_response(),
+                Err(e) => { tracing::error!("get_folder: {e}"); return StatusCode::INTERNAL_SERVER_ERROR.into_response(); }
+                _ => {}
+            }
+            match db::is_descendant_of(&state.pool, pid, &id).await {
+                Ok(true) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "不能移动到自己的子文件夹"}))).into_response(),
+                Err(e) => { tracing::error!("is_descendant_of: {e}"); return StatusCode::INTERNAL_SERVER_ERROR.into_response(); }
+                _ => {}
+            }
+        }
+        match db::move_folder(&state.pool, &id, target).await {
+            Ok(true) => {}
+            Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+            Err(e) => { tracing::error!("move_folder: {e}"); return StatusCode::INTERNAL_SERVER_ERROR.into_response(); }
+        }
     }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 // ── DELETE /v1/folders/{id} ──

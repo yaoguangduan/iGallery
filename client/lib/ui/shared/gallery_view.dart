@@ -2,11 +2,13 @@ import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart' show ScrollCacheExtent;
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
 import '../../core/api.dart';
 import '../../core/display_prefs.dart';
+import '../../core/hash_sync.dart';
 import '../../core/download_service.dart';
 import '../../core/media_service.dart';
 import '../../core/platform.dart';
@@ -16,6 +18,7 @@ import '../../core/upload_manager.dart';
 import '../../theme/app_theme.dart';
 import 'app_kit.dart';
 import 'app_toast.dart';
+import 'cached_thumb.dart';
 import 'drag_select.dart';
 import 'gallery_groups.dart';
 import 'gallery_widgets.dart';
@@ -25,10 +28,43 @@ import 'settings_sheet.dart';
 import 'upload_bar.dart';
 import 'upload_history_page.dart';
 
+enum SelectionActionMode { media, localUpload }
+
+/// Shell 层回调接口，避免 gallery_view 和 gallery_shell 循环依赖。
+abstract class GalleryShellHost {
+  void openViewer({
+    required List<MediaItem> items,
+    required int index,
+    required MediaService service,
+    void Function(String)? onDeleted,
+  });
+  void updateSelection({
+    required int sourceTab,
+    required bool selecting,
+    required Set<String> selectedIds,
+    required bool allSelected,
+    required bool allFavorite,
+    SelectionActionMode mode = SelectionActionMode.media,
+    VoidCallback? onToggleSelectAll,
+    VoidCallback? onFavorite,
+    VoidCallback? onMove,
+    VoidCallback? onDownload,
+    VoidCallback? onDelete,
+    VoidCallback? onUpload,
+    VoidCallback? onExitSelection,
+  });
+  void pickAndUpload({String? folderId});
+  void switchToTab(int index);
+}
+
 bool get _isDesktop => isDesktop;
 
+enum GalleryMode { allMedia, albums }
+
 class GalleryView extends StatefulWidget {
-  const GalleryView({super.key});
+  final GalleryMode mode;
+  final GalleryShellHost? shell;
+  const GalleryView({super.key, this.mode = GalleryMode.albums, this.shell});
 
   @override
   State<GalleryView> createState() => _GalleryViewState();
@@ -36,10 +72,14 @@ class GalleryView extends StatefulWidget {
 
 class _GalleryViewState extends State<GalleryView>
     with SingleTickerProviderStateMixin {
+  static const int _pageSize = 80;
+
   final _scaffoldKey = GlobalKey<ScaffoldState>();
   final _scrollCtrl = ScrollController();
   final List<MediaItem> _items = [];
+  final Set<String> _itemIds = {};
   bool _loading = false;
+  bool _paginationBlocked = false;
   String? _nextCursor;
   int _total = 0;
   bool _showScrollTop = false;
@@ -55,22 +95,20 @@ class _GalleryViewState extends State<GalleryView>
 
   // 下载进度（仅"逐个下载"模式使用；上传走 UploadManager）
   bool _downloading = false;
+  bool _resolving = false;
   int _downloadCompleted = 0;
+
+  // (unused state removed — floating bar deleted)
   int _downloadTotal = 0;
 
   int? _viewerIndex;
   MediaService? _service;
 
-  DisplayPrefs? _lastPrefs;
-
   // folder navigation
   String? _currentFolderId;
   final List<({String id, String name})> _folderPath = [];
   List<FolderItem> _folders = [];
-
-  // search（内嵌在内容顶部，无"搜索模式"状态；有没有在搜由 _searchQuery 决定）
-  final _searchCtrl = TextEditingController();
-  String _searchQuery = '';
+  bool _breadcrumbExpanded = false;
 
   // 双指缩放列数：自己数指针，不用 ScaleGestureRecognizer（会被 scroll 抢走）
   final Set<int> _activePointers = {};
@@ -92,29 +130,50 @@ class _GalleryViewState extends State<GalleryView>
       vsync: this,
       duration: const Duration(milliseconds: 240),
     )..addListener(() => setState(() {}));
+    if (_embedded) UploadManager.instance.addListener(_onUploadChanged);
   }
 
   @override
   void dispose() {
     _scrollCtrl.removeListener(_onScroll);
     _scrollCtrl.dispose();
-    _searchCtrl.dispose();
     _settleCtrl.dispose();
+    if (_embedded) UploadManager.instance.removeListener(_onUploadChanged);
     super.dispose();
+  }
+
+  bool _wasUploading = false;
+  void _onUploadChanged() {
+    final uploading = UploadManager.instance.uploading;
+    if (_wasUploading && !uploading) {
+      _refresh();
+      HashSync.instance.syncFromServer();
+    }
+    _wasUploading = uploading;
   }
 
   void _onScroll() {
     final pos = _scrollCtrl.position;
 
-    // 回到顶部按钮
     final show = pos.pixels > 800;
     if (show != _showScrollTop) setState(() => _showScrollTop = show);
 
-    // 底部加载更多：距离底部 200px 时触发
-    if (pos.pixels >= pos.maxScrollExtent - 200 && !_loading && _hasMore) {
-      final prefs = context.read<DisplayPrefs>();
-      _loadPage(prefs);
+    if (pos.extentAfter <= 320 &&
+        !_loading &&
+        _hasMore &&
+        !_paginationBlocked) {
+      _loadPage(context.read<DisplayPrefs>());
     }
+  }
+
+  void _scheduleViewportFill() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_scrollCtrl.hasClients) return;
+      if (_loading || !_hasMore || _paginationBlocked) return;
+      if (_scrollCtrl.position.extentAfter <= 320) {
+        _loadPage(context.read<DisplayPrefs>());
+      }
+    });
   }
 
   @override
@@ -125,15 +184,14 @@ class _GalleryViewState extends State<GalleryView>
 
     if (state.status == ConnectionStatus.connected && _service == null) {
       _service = MediaService(state);
-      _lastPrefs = prefs;
       _reload(prefs);
+      HashSync.instance.syncFromServer();
     } else if (state.status != ConnectionStatus.connected) {
       _service = null;
     }
   }
 
   void _onPrefsChanged(DisplayPrefs prefs) {
-    _lastPrefs = prefs;
     if (_scrollCtrl.hasClients) {
       _scrollCtrl.jumpTo(0);
     }
@@ -143,12 +201,22 @@ class _GalleryViewState extends State<GalleryView>
   Future<void> _reload(DisplayPrefs prefs) async {
     if (_service == null) return;
     final seq = _reloadSeq.bump();
-    setState(() => _loading = true);
+    setState(() {
+      _loading = true;
+      _nextCursor = null;
+      _paginationBlocked = false;
+    });
     try {
-      final isSearching = _searchQuery.isNotEmpty;
-      final showFolders = !isSearching && prefs.mediaFilter != MediaFilter.favoritesOnly;
+      final showFolders =
+          widget.mode == GalleryMode.albums &&
+          prefs.mediaFilter != MediaFilter.favoritesOnly;
       final futures = <Future>[
-        _service!.query(size: 40, filter: _buildFilter(prefs), sort: _buildSort(prefs), withTotal: true),
+        _service!.query(
+          size: _pageSize,
+          filter: _buildFilter(prefs),
+          sort: _buildSort(prefs),
+          withTotal: true,
+        ),
       ];
       if (showFolders) {
         futures.add(_service!.listFolders(parentId: _currentFolderId));
@@ -156,24 +224,27 @@ class _GalleryViewState extends State<GalleryView>
       final results = await Future.wait(futures);
       if (!mounted || !_reloadSeq.valid(seq)) return;
       final mediaResult = results[0] as QueryResult;
-      final folders = showFolders ? results[1] as List<FolderItem> : <FolderItem>[];
+      final folders = showFolders
+          ? results[1] as List<FolderItem>
+          : <FolderItem>[];
       setState(() {
-        _items.clear();
-        _items.addAll(mediaResult.items);
+        _items
+          ..clear()
+          ..addAll(mediaResult.items);
+        _itemIds
+          ..clear()
+          ..addAll(mediaResult.items.map((item) => item.id));
         _total = mediaResult.total ?? mediaResult.items.length;
         _nextCursor = mediaResult.nextCursor;
         _folders = folders;
         _loading = false;
       });
-      // 新内容布局完成后再把搜索框滚出视野（此时 maxScrollExtent 才是准的）
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        _hideSearchBar();
-      });
+      _scheduleViewportFill();
     } on ApiException catch (e) {
       if (!mounted || !_reloadSeq.valid(seq)) return;
       setState(() => _loading = false);
       showToast(context, e.userMessage, kind: ToastKind.error);
-    } catch (e) {
+    } catch (_) {
       if (!mounted || !_reloadSeq.valid(seq)) return;
       setState(() => _loading = false);
       showToast(context, '加载失败', kind: ToastKind.error);
@@ -185,12 +256,16 @@ class _GalleryViewState extends State<GalleryView>
       {'field': 'deleted_at', 'op': 'is_null'},
     ];
 
-    if (_searchQuery.isNotEmpty) {
-      conditions.add({'field': 'filename', 'op': 'like', 'value': '%$_searchQuery%'});
+    if (widget.mode == GalleryMode.allMedia) {
+      // 跨文件夹查全部，不加 folder_id 条件
     } else if (_currentFolderId == null) {
       conditions.add({'field': 'folder_id', 'op': 'is_null'});
     } else {
-      conditions.add({'field': 'folder_id', 'op': '=', 'value': _currentFolderId});
+      conditions.add({
+        'field': 'folder_id',
+        'op': '=',
+        'value': _currentFolderId,
+      });
     }
 
     if (prefs.mediaFilter == MediaFilter.photosOnly) {
@@ -208,9 +283,14 @@ class _GalleryViewState extends State<GalleryView>
     }
     if (prefs.dateFrom != null && prefs.dateTo != null) {
       conditions.add({
-        'field': 'taken_at', 'op': 'between',
-        'value': [toServerRfc3339(prefs.dateFrom!),
-                   toServerRfc3339(prefs.dateTo!.add(const Duration(days: 1)))],
+        'field': 'taken_at',
+        'op': '>=',
+        'value': toServerRfc3339(prefs.dateFrom!),
+      });
+      conditions.add({
+        'field': 'taken_at',
+        'op': '<',
+        'value': toServerRfc3339(prefs.dateTo!.add(const Duration(days: 1))),
       });
     }
 
@@ -225,33 +305,53 @@ class _GalleryViewState extends State<GalleryView>
       SortField.filename => 'filename',
     };
     final dir = prefs.sortOrder == SortOrder.asc ? 'asc' : 'desc';
-    return [{'field': field, 'dir': dir}];
+    return [
+      {'field': field, 'dir': dir},
+    ];
   }
 
   Future<void> _loadPage(DisplayPrefs prefs) async {
-    if (_loading || !_hasMore || _service == null) return;
+    if (_loading || !_hasMore || _service == null || _paginationBlocked) return;
+    final cursor = _nextCursor;
+    if (cursor == null) return;
     final seq = _reloadSeq.bump();
     setState(() => _loading = true);
     try {
       final result = await _service!.query(
-        size: 40,
+        size: _pageSize,
         filter: _buildFilter(prefs),
         sort: _buildSort(prefs),
-        cursor: _nextCursor,
+        cursor: cursor,
       );
       if (!mounted || !_reloadSeq.valid(seq)) return;
+      final freshItems = result.items
+          .where((item) => !_itemIds.contains(item.id))
+          .toList(growable: false);
+      final stalled =
+          result.nextCursor == cursor ||
+          (freshItems.isEmpty && result.nextCursor != null);
       setState(() {
-        _items.addAll(result.items);
-        _nextCursor = result.nextCursor;
+        _items.addAll(freshItems);
+        _itemIds.addAll(freshItems.map((item) => item.id));
+        _nextCursor = stalled ? null : result.nextCursor;
+        _paginationBlocked = stalled;
         _loading = false;
       });
+      _scheduleViewportFill();
     } on ApiException catch (e) {
       if (!mounted || !_reloadSeq.valid(seq)) return;
-      setState(() => _loading = false);
-      showToast(context, e.userMessage, kind: ToastKind.error);
-    } catch (e) {
+      setState(() {
+        _loading = false;
+        _paginationBlocked = true;
+      });
+      showToast(context, '${e.userMessage}，下拉刷新后可重试', kind: ToastKind.error);
+    } catch (_) {
       if (!mounted || !_reloadSeq.valid(seq)) return;
-      setState(() => _loading = false);
+      setState(() {
+        _loading = false;
+        _paginationBlocked = true;
+      });
+      showToast(context, '加载更多失败，下拉刷新后可重试', kind: ToastKind.error);
     }
   }
 
@@ -261,6 +361,13 @@ class _GalleryViewState extends State<GalleryView>
       await state.tryLocalhost();
       return;
     }
+    // 关键：先把滚动位置重置到顶部，再重新拉数据。
+    // 不这么做会有一串连锁问题：_reload 会把 _items 清空只留第一页，
+    // 但 ScrollController 还停在原先的高位（比如 5000px）。列表变短后
+    // Flutter 把位置钳到新的 maxScrollExtent（就贴到新短列表的底部了），
+    // 立刻触发 _onScroll 的"距底 200px 加载下一页"，然后一路自动分页 —
+    // 表现就是"刷新完滚到了底部"或"图片不全滑一下才出来"。
+    if (_scrollCtrl.hasClients) _scrollCtrl.jumpTo(0);
     final prefs = context.read<DisplayPrefs>();
     await _reload(prefs);
   }
@@ -272,9 +379,7 @@ class _GalleryViewState extends State<GalleryView>
     _currentFolderId = folder.id;
     _selected.clear();
     _selecting = false;
-    // 换目录必须清搜索：否则旧关键词会静默过滤新目录，连子文件夹一起藏掉
-    _searchQuery = '';
-    _searchCtrl.clear();
+    _breadcrumbExpanded = false;
     if (_scrollCtrl.hasClients) _scrollCtrl.jumpTo(0);
     _reload(context.read<DisplayPrefs>());
   }
@@ -289,9 +394,7 @@ class _GalleryViewState extends State<GalleryView>
     }
     _selected.clear();
     _selecting = false;
-    // 换目录必须清搜索：否则旧关键词会静默过滤新目录，连子文件夹一起藏掉
-    _searchQuery = '';
-    _searchCtrl.clear();
+    _breadcrumbExpanded = false;
     if (_scrollCtrl.hasClients) _scrollCtrl.jumpTo(0);
     _reload(context.read<DisplayPrefs>());
   }
@@ -302,9 +405,7 @@ class _GalleryViewState extends State<GalleryView>
     _currentFolderId = _folderPath.isEmpty ? null : _folderPath.last.id;
     _selected.clear();
     _selecting = false;
-    // 换目录必须清搜索：否则旧关键词会静默过滤新目录，连子文件夹一起藏掉
-    _searchQuery = '';
-    _searchCtrl.clear();
+    _breadcrumbExpanded = false;
     if (_scrollCtrl.hasClients) _scrollCtrl.jumpTo(0);
     _reload(context.read<DisplayPrefs>());
   }
@@ -321,115 +422,11 @@ class _GalleryViewState extends State<GalleryView>
       _exitSelection();
       return;
     }
-    if (_searchQuery.isNotEmpty) {
-      _clearSearch();
-      return;
-    }
     if (_currentFolderId != null) {
       _goBack();
       return;
     }
     // canPop 为 true 时系统已经自己 pop 了，走不到这里
-  }
-
-  // ── 内容顶部：面包屑 + 搜索 ──
-  //
-  // 两者都躺在内容里，顶栏不显示任何目录信息 —— 顶栏宽度有限，
-  // 深目录的面包屑放那儿必然被截断看不全。
-  //
-  // 搜索是微信/Apple 式：**默认藏在视野上方**，滚到顶再往下拉一点才露出，
-  // 位置介于内容和刷新指示器之间。靠首帧把滚动位置设到 _headerScrollExtent 实现，
-  // 不是靠隐藏 widget —— 它始终在树里，所以下拉能连续地把它带出来。
-  // 没有"搜索模式"这个状态，有没有在搜索完全由 _searchQuery 是否为空决定。
-
-  /// 搜索框那一段的高度：上下 padding(10+6) + 搜索框(40)。
-  /// 面包屑已移出这里（是固定行），所以不再随目录层级变化。
-  static const double _headerScrollExtent = 56;
-
-  /// 首帧把搜索框滚出视野。列表内容不足一屏时不做（滚不动，做了也白做）。
-  void _hideSearchBar() {
-    if (!_scrollCtrl.hasClients) return;
-    final target = _headerScrollExtent;
-    final pos = _scrollCtrl.position;
-    if (pos.maxScrollExtent < target) return;
-    if (pos.pixels > 0) return;   // 用户已经滚过了，别抢
-    _scrollCtrl.jumpTo(target);
-  }
-
-  void _clearSearch() {
-    if (_searchQuery.isEmpty && _searchCtrl.text.isEmpty) return;
-    _searchCtrl.clear();
-    _searchQuery = '';
-    FocusScope.of(context).unfocus();
-    _reload(context.read<DisplayPrefs>());
-  }
-
-  void _onSearchSubmit(String query) {
-    final q = query.trim();
-    if (q == _searchQuery) return;
-    _searchQuery = q;
-    FocusScope.of(context).unfocus();
-    _reload(context.read<DisplayPrefs>());
-  }
-
-  /// 内容顶部只放搜索框（面包屑是固定行，在 chips 上方，不跟着滚）。
-  /// 多选时整体淡出，但**保留占位**——增删 sliver 会让后面所有内容位移。
-  Widget _buildInlineHeader(AppColors c) {
-    final active = _searchQuery.isNotEmpty;
-    return SliverOpacity(
-      opacity: _selecting ? 0 : 1,
-      sliver: SliverIgnorePointer(
-        ignoring: _selecting,
-        sliver: SliverToBoxAdapter(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(16, 10, 16, 6),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Container(
-                  height: 40,
-                  padding: const EdgeInsets.symmetric(horizontal: 12),
-                  decoration: BoxDecoration(
-                    color: c.surface2,
-                    borderRadius: BorderRadius.circular(AppRadius.pill),
-                  ),
-                  child: Row(children: [
-                    Icon(Icons.search, size: AppIconSize.md, color: c.onMuted),
-                    const SizedBox(width: 8),
-                    Expanded(child: TextField(
-                      controller: _searchCtrl,
-                      style: TextStyle(color: c.onSurface, fontSize: AppType.sm),
-                      decoration: InputDecoration(
-                        hintText: '搜索文件名',
-                        hintStyle: TextStyle(color: c.onMuted, fontSize: AppType.sm),
-                        border: InputBorder.none,
-                        isDense: true,
-                        contentPadding: EdgeInsets.zero,
-                      ),
-                      textInputAction: TextInputAction.search,
-                      onSubmitted: _onSearchSubmit,
-                      // 只为让清除按钮跟着输入出现/消失；不在这里发请求
-                      onChanged: (_) => setState(() {}),
-                    )),
-                    if (active || _searchCtrl.text.isNotEmpty)
-                      GestureDetector(
-                        onTap: _clearSearch,
-                        child: Icon(Icons.cancel, size: AppIconSize.md, color: c.onMuted),
-                      ),
-                  ]),
-                ),
-                if (active)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 10, left: 4),
-                    child: Text('「$_searchQuery」的结果 · $_total 项',
-                        style: TextStyle(color: c.onSurfaceVariant, fontSize: AppType.xs)),
-                  ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
   }
 
   // ── 文件夹 CRUD ──
@@ -443,20 +440,41 @@ class _GalleryViewState extends State<GalleryView>
         final ctrl = TextEditingController();
         return AlertDialog(
           backgroundColor: c.surface,
-          title: Text('新建文件夹', style: TextStyle(color: c.onSurface, fontSize: AppType.mdPlus, fontWeight: FontWeight.w600)),
+          title: Text(
+            '新建文件夹',
+            style: TextStyle(
+              color: c.onSurface,
+              fontSize: AppType.mdPlus,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
           content: TextField(
-            controller: ctrl, autofocus: true,
+            controller: ctrl,
+            autofocus: true,
             style: TextStyle(color: c.onSurface, fontSize: AppType.md),
             decoration: InputDecoration(
-              hintText: '文件夹名称', hintStyle: TextStyle(color: c.onMuted),
-              filled: true, fillColor: c.surface2,
-              border: OutlineInputBorder(borderRadius: BorderRadius.circular(AppRadius.chip), borderSide: BorderSide.none),
+              hintText: '文件夹名称',
+              hintStyle: TextStyle(color: c.onMuted),
+              filled: true,
+              fillColor: c.surface2,
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(AppRadius.chip),
+                borderSide: BorderSide.none,
+              ),
             ),
           ),
           actions: [
-            TextButton(onPressed: () => Navigator.pop(ctx), child: Text('取消', style: TextStyle(color: c.onSurfaceVariant))),
-            TextButton(onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
-                child: Text('创建', style: TextStyle(color: c.brand, fontWeight: FontWeight.w600))),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: Text('取消', style: TextStyle(color: c.onSurfaceVariant)),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
+              child: Text(
+                '创建',
+                style: TextStyle(color: c.brand, fontWeight: FontWeight.w600),
+              ),
+            ),
           ],
         );
       },
@@ -467,7 +485,9 @@ class _GalleryViewState extends State<GalleryView>
         if (mounted) showToast(context, '已创建「$name」', kind: ToastKind.success);
         _refresh();
       } catch (e) {
-        if (mounted) showToast(context, '创建失败: ${errorText(e)}', kind: ToastKind.error);
+        if (mounted) {
+          showToast(context, '创建失败: ${errorText(e)}', kind: ToastKind.error);
+        }
       }
     }
   }
@@ -481,25 +501,70 @@ class _GalleryViewState extends State<GalleryView>
         borderRadius: BorderRadius.vertical(top: Radius.circular(12)),
       ),
       builder: (ctx) => SafeArea(
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          Container(
-            width: 32, height: 4, margin: const EdgeInsets.symmetric(vertical: 8),
-            decoration: BoxDecoration(color: c.outline, borderRadius: BorderRadius.circular(2)),
-          ),
-          ListTile(
-            leading: Icon(Icons.edit, color: c.onSurfaceVariant),
-            title: Text('重命名', style: TextStyle(color: c.onSurface)),
-            onTap: () { Navigator.pop(ctx); _renameFolder(folder); },
-          ),
-          ListTile(
-            leading: Icon(Icons.delete_outline, color: c.error),
-            title: Text('删除文件夹', style: TextStyle(color: c.error)),
-            onTap: () { Navigator.pop(ctx); _deleteFolderConfirm(folder); },
-          ),
-          const SizedBox(height: 8),
-        ]),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 32,
+              height: 4,
+              margin: const EdgeInsets.symmetric(vertical: 8),
+              decoration: BoxDecoration(
+                color: c.outline,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            ListTile(
+              leading: Icon(Icons.edit, color: c.onSurfaceVariant),
+              title: Text('重命名', style: TextStyle(color: c.onSurface)),
+              onTap: () {
+                Navigator.pop(ctx);
+                _renameFolder(folder);
+              },
+            ),
+            ListTile(
+              leading: Icon(
+                Icons.drive_file_move_outlined,
+                color: c.onSurfaceVariant,
+              ),
+              title: Text('移动文件夹', style: TextStyle(color: c.onSurface)),
+              onTap: () {
+                Navigator.pop(ctx);
+                _moveFolder(folder);
+              },
+            ),
+            ListTile(
+              leading: Icon(Icons.delete_outline, color: c.error),
+              title: Text('删除文件夹', style: TextStyle(color: c.error)),
+              onTap: () {
+                Navigator.pop(ctx);
+                _deleteFolderConfirm(folder);
+              },
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
       ),
     );
+  }
+
+  Future<void> _moveFolder(FolderItem folder) async {
+    if (_service == null) return;
+    final targetId = await _showFolderPicker(excludeFolderId: folder.id);
+    if (targetId == null || !mounted) return;
+    try {
+      await _service!.moveFolder(
+        folder.id,
+        parentId: targetId.isEmpty ? null : targetId,
+      );
+      if (mounted) {
+        showToast(context, '已移动文件夹「${folder.name}」', kind: ToastKind.success);
+      }
+      _refresh();
+    } catch (e) {
+      if (mounted) {
+        showToast(context, '移动失败: ${errorText(e)}', kind: ToastKind.error);
+      }
+    }
   }
 
   Future<void> _renameFolder(FolderItem folder) async {
@@ -511,20 +576,41 @@ class _GalleryViewState extends State<GalleryView>
         final ctrl = TextEditingController(text: folder.name);
         return AlertDialog(
           backgroundColor: c.surface,
-          title: Text('重命名', style: TextStyle(color: c.onSurface, fontSize: AppType.mdPlus, fontWeight: FontWeight.w600)),
+          title: Text(
+            '重命名',
+            style: TextStyle(
+              color: c.onSurface,
+              fontSize: AppType.mdPlus,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
           content: TextField(
-            controller: ctrl, autofocus: true,
+            controller: ctrl,
+            autofocus: true,
             style: TextStyle(color: c.onSurface, fontSize: AppType.md),
             decoration: InputDecoration(
-              hintText: '文件夹名称', hintStyle: TextStyle(color: c.onMuted),
-              filled: true, fillColor: c.surface2,
-              border: OutlineInputBorder(borderRadius: BorderRadius.circular(AppRadius.chip), borderSide: BorderSide.none),
+              hintText: '文件夹名称',
+              hintStyle: TextStyle(color: c.onMuted),
+              filled: true,
+              fillColor: c.surface2,
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(AppRadius.chip),
+                borderSide: BorderSide.none,
+              ),
             ),
           ),
           actions: [
-            TextButton(onPressed: () => Navigator.pop(ctx), child: Text('取消', style: TextStyle(color: c.onSurfaceVariant))),
-            TextButton(onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
-                child: Text('确定', style: TextStyle(color: c.brand, fontWeight: FontWeight.w600))),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: Text('取消', style: TextStyle(color: c.onSurfaceVariant)),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
+              child: Text(
+                '确定',
+                style: TextStyle(color: c.brand, fontWeight: FontWeight.w600),
+              ),
+            ),
           ],
         );
       },
@@ -535,24 +621,31 @@ class _GalleryViewState extends State<GalleryView>
         if (mounted) showToast(context, '已重命名', kind: ToastKind.success);
         _refresh();
       } catch (e) {
-        if (mounted) showToast(context, '重命名失败: ${errorText(e)}', kind: ToastKind.error);
+        if (mounted) {
+          showToast(context, '重命名失败: ${errorText(e)}', kind: ToastKind.error);
+        }
       }
     }
   }
 
   Future<void> _deleteFolderConfirm(FolderItem folder) async {
     if (_service == null) return;
-    final confirmed = await appConfirmDialog(context,
-        title: '删除文件夹',
-        message: '确定删除文件夹「${folder.name}」？\n文件夹必须为空才能删除。',
-        confirmLabel: '删除', destructive: true);
+    final confirmed = await appConfirmDialog(
+      context,
+      title: '删除文件夹',
+      message: '确定删除文件夹「${folder.name}」？\n文件夹必须为空才能删除。',
+      confirmLabel: '删除',
+      destructive: true,
+    );
     if (!confirmed || !mounted) return;
     try {
       await _service!.deleteFolder(folder.id);
       if (mounted) showToast(context, '已删除文件夹', kind: ToastKind.success);
       _refresh();
     } catch (e) {
-      if (mounted) showToast(context, '删除失败: ${errorText(e)}', kind: ToastKind.error);
+      if (mounted) {
+        showToast(context, '删除失败: ${errorText(e)}', kind: ToastKind.error);
+      }
     }
   }
 
@@ -561,20 +654,61 @@ class _GalleryViewState extends State<GalleryView>
     final targetId = await _showFolderPicker();
     if (targetId == null || !mounted) return;
     try {
-      await _service!.batchMove(_selected.toList(), folderId: targetId.isEmpty ? null : targetId);
-      showToast(context, '已移动 ${_selected.length} 个文件', kind: ToastKind.success);
+      await _service!.batchMove(
+        _selected.toList(),
+        folderId: targetId.isEmpty ? null : targetId,
+      );
+      if (!mounted) return;
+      showToast(
+        context,
+        '已移动 ${_selected.length} 个文件',
+        kind: ToastKind.success,
+      );
       _exitSelection();
       _refresh();
     } catch (e) {
-      if (mounted) showToast(context, '移动失败: ${errorText(e)}', kind: ToastKind.error);
+      if (mounted) {
+        showToast(context, '移动失败: ${errorText(e)}', kind: ToastKind.error);
+      }
     }
   }
 
-  Future<String?> _showFolderPicker() async {
+  Future<String?> _showFolderPicker({String? excludeFolderId}) async {
     if (_service == null) return null;
-    return showDialog<String>(
+    final c = context.colors;
+    final picker = FolderPickerSheet(
+      service: _service!,
+      currentFolderId: _currentFolderId,
+      excludeFolderId: excludeFolderId,
+    );
+    if (_isDesktop) {
+      return showDialog<String>(
+        context: context,
+        builder: (ctx) => Dialog(
+          backgroundColor: c.bg,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(AppRadius.sheet),
+          ),
+          child: SizedBox(width: 380, height: 480, child: picker),
+        ),
+      );
+    }
+    return showModalBottomSheet<String>(
       context: context,
-      builder: (ctx) => FolderPickerDialog(service: _service!, currentFolderId: _currentFolderId),
+      backgroundColor: c.bg,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(
+          top: Radius.circular(AppRadius.sheet),
+        ),
+      ),
+      builder: (ctx) => DraggableScrollableSheet(
+        expand: false,
+        initialChildSize: 0.7,
+        maxChildSize: 0.9,
+        minChildSize: 0.4,
+        builder: (ctx, _) => picker,
+      ),
     );
   }
 
@@ -589,6 +723,7 @@ class _GalleryViewState extends State<GalleryView>
         _selected.add(id);
       }
     });
+    _syncSelection();
   }
 
   bool get _allSelected =>
@@ -608,6 +743,7 @@ class _GalleryViewState extends State<GalleryView>
         _selected.addAll(_items.map((e) => e.id));
       }
     });
+    _syncSelection();
   }
 
   void _toggleGroupSelect(GalleryGroup group) {
@@ -619,10 +755,15 @@ class _GalleryViewState extends State<GalleryView>
         _selected.addAll(groupIds);
       }
     });
+    _syncSelection();
   }
 
   void _exitSelection() {
-    setState(() { _selecting = false; _selected.clear(); });
+    setState(() {
+      _selecting = false;
+      _selected.clear();
+    });
+    _syncSelection();
   }
 
   // ── 滑选（多选模式下按住拖动，命中判定见 drag_select.dart）──
@@ -652,8 +793,14 @@ class _GalleryViewState extends State<GalleryView>
       // 区间外还原到按下前的状态，区间内整段应用 —— 回拖能正确取消
       for (var i = 0; i < _items.length; i++) {
         final id = _items[i].id;
-        final on = (i >= lo && i <= hi) ? _sweepAdding : _sweepBaseline.contains(id);
-        if (on) { _selected.add(id); } else { _selected.remove(id); }
+        final on = (i >= lo && i <= hi)
+            ? _sweepAdding
+            : _sweepBaseline.contains(id);
+        if (on) {
+          _selected.add(id);
+        } else {
+          _selected.remove(id);
+        }
       }
     });
   }
@@ -661,8 +808,8 @@ class _GalleryViewState extends State<GalleryView>
   void _sweepEnd() {
     _sweepAnchor = null;
     _sweepBaseline = {};
-    // 滑到一个都不剩就退出多选，和点选的行为一致
     if (_selected.isEmpty && _selecting) setState(() => _selecting = false);
+    _syncSelection();
   }
 
   Future<void> _favoriteSelected() async {
@@ -680,31 +827,43 @@ class _GalleryViewState extends State<GalleryView>
         }
       }
       if (mounted) {
-        showToast(context, target ? '已收藏 ${_selected.length} 个' : '已取消收藏 ${_selected.length} 个',
-            kind: ToastKind.success);
+        showToast(
+          context,
+          target ? '已收藏 ${_selected.length} 个' : '已取消收藏 ${_selected.length} 个',
+          kind: ToastKind.success,
+        );
         _exitSelection();
         _refresh();
       }
     } on ApiException catch (e) {
-      if (mounted) showToast(context, '操作失败: ${e.displayMessage}', kind: ToastKind.error);
+      if (mounted) {
+        showToast(context, '操作失败: ${e.displayMessage}', kind: ToastKind.error);
+      }
     }
   }
 
   Future<void> _deleteSelected() async {
     if (_selected.isEmpty || _service == null) return;
-    final confirmed = await appConfirmDialog(context,
-        title: '删除',
-        message: '确定删除选中的 ${_selected.length} 个文件？',
-        confirmLabel: '删除', destructive: true);
+    final confirmed = await appConfirmDialog(
+      context,
+      title: '删除',
+      message: '确定删除选中的 ${_selected.length} 个文件？',
+      confirmLabel: '删除',
+      destructive: true,
+    );
     if (!confirmed || !mounted) return;
     final count = _selected.length;
     try {
       await _service!.batchDelete(_selected.toList());
-      if (mounted) showToast(context, '已删除 $count 个文件', kind: ToastKind.success);
+      if (mounted) {
+        showToast(context, '已删除 $count 个文件', kind: ToastKind.success);
+      }
       _exitSelection();
       await _refresh();
     } on ApiException catch (e) {
-      if (mounted) showToast(context, '删除失败: ${e.displayMessage}', kind: ToastKind.error);
+      if (mounted) {
+        showToast(context, '删除失败: ${e.displayMessage}', kind: ToastKind.error);
+      }
     } catch (_) {
       if (mounted) showToast(context, '删除失败', kind: ToastKind.error);
     }
@@ -717,11 +876,18 @@ class _GalleryViewState extends State<GalleryView>
     final choice = await showDialog<_DownloadMode>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: Text('下载 $count 个文件',
-            style: TextStyle(color: c.onSurface, fontSize: AppType.mdPlus,
-                fontWeight: FontWeight.w600)),
-        content: Text('请选择下载方式',
-            style: TextStyle(color: c.onSurfaceVariant, fontSize: AppType.md)),
+        title: Text(
+          '下载 $count 个文件',
+          style: TextStyle(
+            color: c.onSurface,
+            fontSize: AppType.mdPlus,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+        content: Text(
+          '请选择下载方式',
+          style: TextStyle(color: c.onSurfaceVariant, fontSize: AppType.md),
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx, _DownloadMode.direct),
@@ -729,8 +895,10 @@ class _GalleryViewState extends State<GalleryView>
           ),
           TextButton(
             onPressed: () => Navigator.pop(ctx, _DownloadMode.zip),
-            child: Text('打包下载', style: TextStyle(color: c.brand,
-                fontWeight: FontWeight.w600)),
+            child: Text(
+              '打包下载',
+              style: TextStyle(color: c.brand, fontWeight: FontWeight.w600),
+            ),
           ),
         ],
       ),
@@ -750,20 +918,35 @@ class _GalleryViewState extends State<GalleryView>
           _exitSelection();
         }
       } on ApiException catch (e) {
-        if (mounted) showToast(context, '下载失败: ${e.displayMessage}', kind: ToastKind.error);
+        if (mounted) {
+          showToast(
+            context,
+            '下载失败: ${e.displayMessage}',
+            kind: ToastKind.error,
+          );
+        }
       } catch (_) {
         if (mounted) showToast(context, '下载失败', kind: ToastKind.error);
       }
     } else {
       final dir = await DownloadService.instance.pickSaveDir();
       if (dir == null || !mounted) return; // 用户取消
-      setState(() { _downloading = true; _downloadCompleted = 0; _downloadTotal = count; });
+      setState(() {
+        _downloading = true;
+        _downloadCompleted = 0;
+        _downloadTotal = count;
+      });
       try {
         final report = await _service!.downloadIndividual(
           _selected.toList(),
           saveDir: dir.path,
           onProgress: (c, t) {
-            if (mounted) setState(() { _downloadCompleted = c; _downloadTotal = t; });
+            if (mounted) {
+              setState(() {
+                _downloadCompleted = c;
+                _downloadTotal = t;
+              });
+            }
           },
         );
         if (mounted) {
@@ -771,15 +954,28 @@ class _GalleryViewState extends State<GalleryView>
           if (report.failed == 0) {
             showToast(context, '已下载 ${report.ok} 个文件', kind: ToastKind.success);
           } else if (report.ok == 0) {
-            showToast(context, '下载失败（${report.failed} 个）', kind: ToastKind.error);
+            showToast(
+              context,
+              '下载失败（${report.failed} 个）',
+              kind: ToastKind.error,
+            );
           } else {
-            showToast(context, '已下载 ${report.ok} 个，${report.failed} 个失败',
-                kind: ToastKind.error);
+            showToast(
+              context,
+              '已下载 ${report.ok} 个，${report.failed} 个失败',
+              kind: ToastKind.error,
+            );
           }
           if (report.ok > 0) _exitSelection();
         }
       } on ApiException catch (e) {
-        if (mounted) showToast(context, '下载失败: ${e.displayMessage}', kind: ToastKind.error);
+        if (mounted) {
+          showToast(
+            context,
+            '下载失败: ${e.displayMessage}',
+            kind: ToastKind.error,
+          );
+        }
       } catch (_) {
         if (mounted) showToast(context, '下载失败', kind: ToastKind.error);
       } finally {
@@ -813,65 +1009,45 @@ class _GalleryViewState extends State<GalleryView>
     }
     if (files.isEmpty || !mounted) return;
 
+    setState(() => _resolving = true);
+
     final serverUrl = context.read<ServerState>().baseUrl;
     final result = await UploadManager.instance.enqueue(
-      _service!, files,
+      _service!,
+      files,
       folderId: _currentFolderId,
       serverUrl: serverUrl,
     );
+    if (mounted && _resolving) setState(() => _resolving = false);
 
     if (mounted) {
       final parts = <String>['已上传 ${result.uploaded} 个'];
       if (result.dedup > 0) parts.add('${result.dedup} 个已存在跳过');
       if (result.failed > 0) parts.add('${result.failed} 个失败');
       if (result.cancelled > 0) parts.add('${result.cancelled} 个已取消');
-      showToast(context, parts.join(' · '),
-          kind: result.allOk ? ToastKind.success : ToastKind.error);
+      showToast(
+        context,
+        parts.join(' · '),
+        kind: result.allOk ? ToastKind.success : ToastKind.error,
+      );
       _refresh();
     }
   }
 
-  /// 移动端上传入口:弹出"从相册 / 从文件"二选一。
-  /// 相册走 photo_manager,拿得到拍摄时间和多选滑动;
-  /// 文件走 SAF/Files,覆盖非相册目录、微信下载、第三方 app 存的文件。
   Future<void> _showUploadSourceSheet() async {
-    if (_isDesktop) { _pickAndUpload(); return; }
-    final c = context.colors;
-    final choice = await showModalBottomSheet<String>(
-      context: context,
-      backgroundColor: c.bg,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(AppRadius.sheet)),
-      ),
-      builder: (ctx) => SafeArea(
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          const SheetHandle(),
-          ListTile(
-            leading: Icon(Icons.photo_library_outlined, color: c.onSurface),
-            title: Text('从相册选择',
-                style: TextStyle(color: c.onSurface, fontSize: AppType.sm)),
-            subtitle: Text('图片和视频,可多选',
-                style: TextStyle(color: c.onMuted, fontSize: AppType.xxs)),
-            onTap: () => Navigator.pop(ctx, 'album'),
-          ),
-          ListTile(
-            leading: Icon(Icons.folder_open_outlined, color: c.onSurface),
-            title: Text('从文件选择',
-                style: TextStyle(color: c.onSurface, fontSize: AppType.sm)),
-            subtitle: Text('任意目录、任意格式',
-                style: TextStyle(color: c.onMuted, fontSize: AppType.xxs)),
-            onTap: () => Navigator.pop(ctx, 'files'),
-          ),
-          const SizedBox(height: 8),
-        ]),
-      ),
-    );
-    if (choice == 'album') _pickAndUpload();
-    if (choice == 'files') _pickAndUpload(fromFiles: true);
+    if (_isDesktop) {
+      await _pickAndUpload(fromFiles: true);
+      return;
+    }
+    final source = await showUploadSourcePicker(context);
+    if (!mounted || source == null) return;
+    await _pickAndUpload(fromFiles: source == UploadSource.files);
   }
 
   void _openUploadHistory() {
-    Navigator.of(context).push(MaterialPageRoute(builder: (_) => const UploadHistoryPage()));
+    Navigator.of(
+      context,
+    ).push(MaterialPageRoute(builder: (_) => const UploadHistoryPage()));
   }
 
   // ── 桌面右键菜单 ──
@@ -882,21 +1058,49 @@ class _GalleryViewState extends State<GalleryView>
       position: RelativeRect.fromLTRB(pos.dx, pos.dy, pos.dx, pos.dy),
       color: c.surface,
       items: [
-        PopupMenuItem(value: 'new_folder', child: Row(children: [
-          Icon(Icons.create_new_folder_outlined, size: 18, color: c.onSurfaceVariant),
-          const SizedBox(width: 12),
-          Text('新建文件夹', style: TextStyle(color: c.onSurface, fontSize: AppType.sm)),
-        ])),
-        PopupMenuItem(value: 'refresh', child: Row(children: [
-          Icon(Icons.refresh, size: 18, color: c.onSurfaceVariant),
-          const SizedBox(width: 12),
-          Text('刷新', style: TextStyle(color: c.onSurface, fontSize: AppType.sm)),
-        ])),
-        PopupMenuItem(value: 'upload', child: Row(children: [
-          Icon(Icons.upload_rounded, size: 18, color: c.onSurfaceVariant),
-          const SizedBox(width: 12),
-          Text('上传', style: TextStyle(color: c.onSurface, fontSize: AppType.sm)),
-        ])),
+        PopupMenuItem(
+          value: 'new_folder',
+          child: Row(
+            children: [
+              Icon(
+                Icons.create_new_folder_outlined,
+                size: 18,
+                color: c.onSurfaceVariant,
+              ),
+              const SizedBox(width: 12),
+              Text(
+                '新建文件夹',
+                style: TextStyle(color: c.onSurface, fontSize: AppType.sm),
+              ),
+            ],
+          ),
+        ),
+        PopupMenuItem(
+          value: 'refresh',
+          child: Row(
+            children: [
+              Icon(Icons.refresh, size: 18, color: c.onSurfaceVariant),
+              const SizedBox(width: 12),
+              Text(
+                '刷新',
+                style: TextStyle(color: c.onSurface, fontSize: AppType.sm),
+              ),
+            ],
+          ),
+        ),
+        PopupMenuItem(
+          value: 'upload',
+          child: Row(
+            children: [
+              Icon(Icons.upload_rounded, size: 18, color: c.onSurfaceVariant),
+              const SizedBox(width: 12),
+              Text(
+                '上传',
+                style: TextStyle(color: c.onSurface, fontSize: AppType.sm),
+              ),
+            ],
+          ),
+        ),
       ],
     ).then((v) {
       if (v == 'new_folder') _createFolder();
@@ -911,53 +1115,124 @@ class _GalleryViewState extends State<GalleryView>
       position: RelativeRect.fromLTRB(pos.dx, pos.dy, pos.dx, pos.dy),
       color: c.surface,
       items: [
-        PopupMenuItem(value: 'open', child: Row(children: [
-          Icon(Icons.open_in_new, size: 18, color: c.onSurfaceVariant),
-          const SizedBox(width: 12),
-          Text('打开', style: TextStyle(color: c.onSurface, fontSize: AppType.sm)),
-        ])),
-        PopupMenuItem(value: 'favorite', child: Row(children: [
-          Icon(item.isFavorite ? Icons.favorite : Icons.favorite_border, size: 18,
-              color: item.isFavorite ? c.onSurface : c.onSurfaceVariant),
-          const SizedBox(width: 12),
-          Text(item.isFavorite ? '取消收藏' : '收藏', style: TextStyle(color: c.onSurface, fontSize: AppType.sm)),
-        ])),
-        PopupMenuItem(value: 'move', child: Row(children: [
-          Icon(Icons.drive_file_move_outlined, size: 18, color: c.onSurfaceVariant),
-          const SizedBox(width: 12),
-          Text('移动', style: TextStyle(color: c.onSurface, fontSize: AppType.sm)),
-        ])),
-        PopupMenuItem(value: 'delete', child: Row(children: [
-          Icon(Icons.delete_outline, size: 18, color: c.error),
-          const SizedBox(width: 12),
-          Text('删除', style: TextStyle(color: c.error, fontSize: AppType.sm)),
-        ])),
+        PopupMenuItem(
+          value: 'open',
+          child: Row(
+            children: [
+              Icon(Icons.open_in_new, size: 18, color: c.onSurfaceVariant),
+              const SizedBox(width: 12),
+              Text(
+                '打开',
+                style: TextStyle(color: c.onSurface, fontSize: AppType.sm),
+              ),
+            ],
+          ),
+        ),
+        PopupMenuItem(
+          value: 'favorite',
+          child: Row(
+            children: [
+              Icon(
+                item.isFavorite ? Icons.favorite : Icons.favorite_border,
+                size: 18,
+                color: item.isFavorite ? c.onSurface : c.onSurfaceVariant,
+              ),
+              const SizedBox(width: 12),
+              Text(
+                item.isFavorite ? '取消收藏' : '收藏',
+                style: TextStyle(color: c.onSurface, fontSize: AppType.sm),
+              ),
+            ],
+          ),
+        ),
+        PopupMenuItem(
+          value: 'move',
+          child: Row(
+            children: [
+              Icon(
+                Icons.drive_file_move_outlined,
+                size: 18,
+                color: c.onSurfaceVariant,
+              ),
+              const SizedBox(width: 12),
+              Text(
+                '移动',
+                style: TextStyle(color: c.onSurface, fontSize: AppType.sm),
+              ),
+            ],
+          ),
+        ),
+        PopupMenuItem(
+          value: 'delete',
+          child: Row(
+            children: [
+              Icon(Icons.delete_outline, size: 18, color: c.error),
+              const SizedBox(width: 12),
+              Text(
+                '删除',
+                style: TextStyle(color: c.error, fontSize: AppType.sm),
+              ),
+            ],
+          ),
+        ),
       ],
     ).then((v) async {
+      if (!mounted) return;
       if (v == 'open') {
-        setState(() => _viewerIndex = _items.indexOf(item));
+        _openViewer(_items.indexOf(item));
       } else if (v == 'favorite') {
         try {
           final target = !item.isFavorite;
           await _service!.batchFavorite([item.id], favorite: target);
           final idx = _items.indexWhere((m) => m.id == item.id);
-          if (idx >= 0) _items[idx] = _items[idx].copyWith(favorite: target ? 1 : 0);
-          if (mounted) { setState(() {}); showToast(context, target ? '已收藏' : '已取消收藏', kind: ToastKind.success); }
+          if (idx >= 0) {
+            _items[idx] = _items[idx].copyWith(favorite: target ? 1 : 0);
+          }
+          if (mounted) {
+            setState(() {});
+            showToast(
+              context,
+              target ? '已收藏' : '已取消收藏',
+              kind: ToastKind.success,
+            );
+          }
         } on ApiException catch (e) {
-          if (mounted) showToast(context, '操作失败: ${e.displayMessage}', kind: ToastKind.error);
+          if (mounted) {
+            showToast(
+              context,
+              '操作失败: ${e.displayMessage}',
+              kind: ToastKind.error,
+            );
+          }
         }
       } else if (v == 'move') {
-        _selected.clear(); _selected.add(item.id); _selecting = true;
+        _selected.clear();
+        _selected.add(item.id);
+        _selecting = true;
         _moveSelected();
       } else if (v == 'delete') {
-        final ok = await appConfirmDialog(context, title: '删除', message: '确定删除 ${item.filename}？', confirmLabel: '删除', destructive: true);
+        final ok = await appConfirmDialog(
+          context,
+          title: '删除',
+          message: '确定删除 ${item.filename}？',
+          confirmLabel: '删除',
+          destructive: true,
+        );
         if (!ok || !mounted) return;
         try {
           await _service!.delete(item.id);
-          if (mounted) showToast(context, '已删除 ${item.filename}', kind: ToastKind.success);
+          if (mounted) {
+            showToast(context, '已删除 ${item.filename}', kind: ToastKind.success);
+          }
           _refresh();
         } on ApiException catch (e) {
-          if (mounted) showToast(context, '删除失败: ${e.displayMessage}', kind: ToastKind.error);
+          if (mounted) {
+            showToast(
+              context,
+              '删除失败: ${e.displayMessage}',
+              kind: ToastKind.error,
+            );
+          }
         } catch (_) {
           if (mounted) showToast(context, '删除失败', kind: ToastKind.error);
         }
@@ -968,32 +1243,84 @@ class _GalleryViewState extends State<GalleryView>
   // ── 导航 ──
 
   void _openProfile() {
-    if (_isDesktop) {
+    if (_embedded) {
+      widget.shell!.switchToTab(3);
+    } else if (_isDesktop) {
       _scaffoldKey.currentState?.openDrawer();
     } else {
-      Navigator.of(context).push(
-        MaterialPageRoute(builder: (_) => const MobileProfilePage()),
-      );
+      Navigator.of(
+        context,
+      ).push(MaterialPageRoute(builder: (_) => const MobileProfilePage()));
     }
+  }
+
+  void _openSortSettings() {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => SortSettingsSheet(
+        onChanged: () => _onPrefsChanged(context.read<DisplayPrefs>()),
+      ),
+    );
+  }
+
+  void _openFilterSettings() {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => FilterSettingsSheet(
+        onChanged: () => _onPrefsChanged(context.read<DisplayPrefs>()),
+      ),
+    );
   }
 
   void _openDisplaySettings() {
-    if (_isDesktop) {
-      _scaffoldKey.currentState?.openEndDrawer();
-    } else {
-      showModalBottomSheet(
-        context: context,
-        isScrollControlled: true,
-        backgroundColor: Colors.transparent,
-        builder: (_) => DisplaySettingsSheet(onChanged: () {
-          final prefs = context.read<DisplayPrefs>();
-          _onPrefsChanged(prefs);
-        }),
-      );
-    }
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => const DisplaySettingsSheet(),
+    );
   }
 
   // ── build ──
+
+  bool get _embedded => widget.shell != null;
+
+  void _openViewer(int index) {
+    if (_embedded && _service != null) {
+      widget.shell!.openViewer(
+        items: _items,
+        index: index,
+        service: _service!,
+        onDeleted: (id) => setState(() {
+          _items.removeWhere((m) => m.id == id);
+          _itemIds.remove(id);
+        }),
+      );
+    } else {
+      setState(() => _viewerIndex = index);
+    }
+  }
+
+  void _syncSelection() {
+    if (!_embedded) return;
+    widget.shell!.updateSelection(
+      sourceTab: 0,
+      selecting: _selecting,
+      selectedIds: _selected,
+      allSelected: _allSelected,
+      allFavorite: _selectedAllFavorite,
+      onToggleSelectAll: _toggleSelectAll,
+      onFavorite: _favoriteSelected,
+      onMove: _moveSelected,
+      onDownload: _downloadSelected,
+      onDelete: _deleteSelected,
+      onExitSelection: _exitSelection,
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1001,6 +1328,10 @@ class _GalleryViewState extends State<GalleryView>
     final state = context.watch<ServerState>();
     final prefs = context.watch<DisplayPrefs>();
 
+    // 移动端嵌入 shell：只渲染内容区域，不包 Scaffold
+    if (_embedded) return _buildContent(c, state, prefs);
+
+    // 桌面端：完整 Scaffold（保持原有行为）
     return AnnotatedRegion<SystemUiOverlayStyle>(
       value: SystemUiOverlayStyle(
         statusBarColor: c.bg,
@@ -1010,83 +1341,72 @@ class _GalleryViewState extends State<GalleryView>
         systemNavigationBarIconBrightness: Brightness.dark,
       ),
       child: PopScope(
-      // 返回手势/返回键的处理顺序，从"最浮在上面"到"最底层"。
-      //
-      // canPop 和 _handleBack 必须**枚举同一组状态**，漏一个就是"返回键
-      // 越级把上一层也退了"这类 bug。加新的可关闭状态时两处一起改。
-      //
-      //   1. 查看器打开   → 关查看器
-      //   2. 多选中       → 退出多选
-      //   3. 有搜索结果   → 清搜索
-      //   4. 在子目录     → 回上一级
-      //   5. 都没有       → 真的 pop（退出 app）
-      canPop: _viewerIndex == null
-          && !_selecting
-          && _searchQuery.isEmpty
-          && _currentFolderId == null,
-      onPopInvokedWithResult: (didPop, _) {
-        if (didPop) return;
-        _handleBack();
-      },
-      child: Scaffold(
-      key: _scaffoldKey,
-      backgroundColor: c.bg,
-      drawer: _isDesktop ? _buildLeftDrawer(c) : null,
-      endDrawer: _isDesktop ? _buildRightDrawer(c, prefs) : null,
-      floatingActionButton: _showScrollTop && _viewerIndex == null
-          ? FloatingActionButton.small(
-              onPressed: () {
-                // 回到"内容顶部"而不是 0 —— 0 会把搜索框亮出来，
-                // 用户只是想回顶看第一批图，不是要搜索
-                _scrollCtrl.animateTo(_headerScrollExtent,
-                    duration: const Duration(milliseconds: 300), curve: Curves.easeOut);
-              },
-              backgroundColor: c.surface2,
-              foregroundColor: c.onSurface,
-              elevation: 0,
-              highlightElevation: 0,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(AppRadius.pill),
-                side: BorderSide(color: c.outline, width: 0.5),
-              ),
-              child: Icon(Icons.keyboard_arrow_up, color: c.onSurface),
-            )
-          : null,
-      body: Stack(
-        fit: StackFit.expand,
-        children: [
-          Column(
+        canPop: _viewerIndex == null && !_selecting && _currentFolderId == null,
+        onPopInvokedWithResult: (didPop, _) {
+          if (didPop) return;
+          _handleBack();
+        },
+        child: Scaffold(
+          key: _scaffoldKey,
+          backgroundColor: c.bg,
+          drawer: _isDesktop ? _buildLeftDrawer(c) : null,
+          floatingActionButton: _showScrollTop && _viewerIndex == null
+              ? FloatingActionButton.small(
+                  onPressed: () {
+                    _scrollCtrl.animateTo(
+                      0,
+                      duration: const Duration(milliseconds: 300),
+                      curve: Curves.easeOut,
+                    );
+                  },
+                  backgroundColor: c.surface2,
+                  foregroundColor: c.onSurface,
+                  elevation: 0,
+                  highlightElevation: 0,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(AppRadius.pill),
+                    side: BorderSide(color: c.outline, width: 0.5),
+                  ),
+                  child: Icon(Icons.keyboard_arrow_up, color: c.onSurface),
+                )
+              : null,
+          body: Stack(
+            fit: StackFit.expand,
             children: [
-              _buildToolbar(c, state, prefs),
-              // chips 在多选时**保留占位**，只是变灰不可点。
-              // 直接摘掉会让下面整块内容往上顿一下 —— 长按进多选时尤其明显。
-              if (state.status == ConnectionStatus.connected)
-                IgnorePointer(
-                  ignoring: _selecting,
-                  child: Opacity(opacity: _selecting ? 0.35 : 1, child: _buildFilterChips(c, prefs)),
+              _buildContent(c, state, prefs),
+              if (_viewerIndex != null && _service != null)
+                MediaViewer(
+                  items: _items,
+                  initialIndex: _viewerIndex!,
+                  service: _service!,
+                  onClose: () => setState(() => _viewerIndex = null),
+                  onDeleted: (id) {
+                    setState(() {
+                      _items.removeWhere((m) => m.id == id);
+                      _itemIds.remove(id);
+                      if (_items.isEmpty) _viewerIndex = null;
+                    });
+                  },
                 ),
-              UploadBar(onTap: _openUploadHistory),
-              if (_downloading) _buildDownloadBar(c),
-              Expanded(child: _buildBody(c, state, prefs)),
+              if (_resolving)
+                _UploadOverlay(
+                  onHide: () => setState(() => _resolving = false),
+                ),
             ],
           ),
-          if (_viewerIndex != null && _service != null)
-            MediaViewer(
-              items: _items,
-              initialIndex: _viewerIndex!,
-              service: _service!,
-              onClose: () => setState(() => _viewerIndex = null),
-              onDeleted: (id) {
-                setState(() {
-                  _items.removeWhere((m) => m.id == id);
-                  if (_items.isEmpty) _viewerIndex = null;
-                });
-              },
-            ),
-        ],
+        ),
       ),
-    ),
-    ),
+    );
+  }
+
+  Widget _buildContent(AppColors c, ServerState state, DisplayPrefs prefs) {
+    return Column(
+      children: [
+        _buildToolbar(c, state, prefs),
+        if (!_embedded) UploadBar(onTap: _openUploadHistory),
+        if (_downloading) _buildDownloadBar(c),
+        Expanded(child: _buildBody(c, state, prefs)),
+      ],
     );
   }
 
@@ -1102,14 +1422,27 @@ class _GalleryViewState extends State<GalleryView>
         child: Column(
           children: [
             Container(
-              height: 58,
+              height: 64,
               padding: const EdgeInsets.symmetric(horizontal: 16),
               child: Row(
                 children: [
-                  Text('设置', style: TextStyle(color: c.onSurface, fontSize: AppType.mdPlus, fontWeight: FontWeight.w700)),
+                  Text(
+                    '设置',
+                    style: TextStyle(
+                      color: c.onSurface,
+                      fontSize: AppType.mdPlus,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
                   const Spacer(),
-                  IconButton(onPressed: () => Navigator.pop(context),
-                      icon: Icon(Icons.close, size: AppIconSize.lg, color: c.onSurfaceVariant)),
+                  IconButton(
+                    onPressed: () => Navigator.pop(context),
+                    icon: Icon(
+                      Icons.close,
+                      size: AppIconSize.lg,
+                      color: c.onSurfaceVariant,
+                    ),
+                  ),
                 ],
               ),
             ),
@@ -1121,295 +1454,380 @@ class _GalleryViewState extends State<GalleryView>
     );
   }
 
-  Widget _buildRightDrawer(AppColors c, DisplayPrefs prefs) {
-    return Drawer(
-      width: 360,
-      backgroundColor: c.bg,
-      elevation: 0,
-      shape: RoundedRectangleBorder(
-        side: BorderSide(color: c.outline, width: 0.5),
-      ),
-      child: SafeArea(
-        child: Column(
-          children: [
-            Container(
-              height: 58,
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: Row(
-                children: [
-                  Text('显示设置', style: TextStyle(color: c.onSurface, fontSize: AppType.mdPlus, fontWeight: FontWeight.w700)),
-                  const Spacer(),
-                  if (prefs.hasActiveFilter)
-                    TextButton(
-                      onPressed: () { prefs.clearFilters(); _onPrefsChanged(prefs); },
-                      child: Text('重置', style: TextStyle(color: c.brand, fontSize: AppType.xs)),
-                    ),
-                  IconButton(onPressed: () => Navigator.pop(context),
-                      icon: Icon(Icons.close, size: AppIconSize.lg, color: c.onSurfaceVariant)),
-                ],
-              ),
-            ),
-            Divider(height: 0.5, thickness: 0.5, color: c.outline),
-            Expanded(child: DisplaySettingsContent(onChanged: () => _onPrefsChanged(prefs))),
-          ],
-        ),
-      ),
-    );
-  }
-
   Widget _buildToolbar(AppColors c, ServerState state, DisplayPrefs prefs) {
     final connected = state.status == ConnectionStatus.connected;
 
     return Container(
-      height: 58,
+      height: 64,
       padding: const EdgeInsets.symmetric(horizontal: 6),
       decoration: BoxDecoration(
         border: Border(bottom: BorderSide(color: c.outline, width: 0.5)),
       ),
       child: Row(
         children: [
-          // 左槽固定：非多选是设置，多选是退出。
-          // 两者占同一个位置，进出多选时不会有 icon 满屏跳。
           if (_selecting)
             IconButton(
               onPressed: _exitSelection,
-              icon: Icon(Icons.close_rounded, size: AppIconSize.lg, color: c.onSurface),
+              icon: Icon(
+                Icons.close_rounded,
+                size: AppIconSize.lg,
+                color: c.onSurface,
+              ),
               tooltip: '退出多选',
             )
+          else if (_embedded)
+            _buildServerLabel(c, state)
           else
             _buildAvatar(c, state),
           if (_selecting) ...[
-            Text('已选 ${_selected.length}',
-                style: TextStyle(color: c.onSurface, fontSize: AppType.sm, fontWeight: FontWeight.w600)),
+            Text(
+              '已选 ${_selected.length}',
+              style: TextStyle(
+                color: c.onSurface,
+                fontSize: AppType.sm,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
             const Spacer(),
           ] else ...[
-            // 路径紧挨头像。深目录折叠成 `…` 下拉，见 _buildToolbarPath。
-            //
-            // 必须 Flexible(fit: loose) + flex: 0：默认的 flex:1 会和后面的
-            // Spacer 平分剩余空间，把右侧按钮从最右边推走。
-            // flex: 0 表示"只要内容宽度，放不下才收缩"，剩余空间全归 Spacer。
-            if (_currentFolderId != null)
-              Flexible(flex: 0, child: _buildToolbarPath(c)),
-            if (!connected)
-              Text(state.status == ConnectionStatus.needAuth ? '需令牌' : '未连接',
-                  style: TextStyle(
-                    color: state.status == ConnectionStatus.needAuth ? c.warn : c.onMuted,
-                    fontSize: AppType.xs)),
-            if (connected && _currentFolderId == null && _total > 0)
-              Text('$_total', style: TextStyle(color: c.onMuted, fontSize: AppType.xs)),
+            if (!connected && !_embedded)
+              Text(
+                state.status == ConnectionStatus.needAuth ? '需令牌' : '未连接',
+                style: TextStyle(
+                  color: state.status == ConnectionStatus.needAuth
+                      ? c.warn
+                      : c.onMuted,
+                  fontSize: AppType.xs,
+                ),
+              ),
+            if (!_embedded &&
+                connected &&
+                _currentFolderId == null &&
+                _total > 0)
+              Text(
+                '$_total',
+                style: TextStyle(color: c.onMuted, fontSize: AppType.xs),
+              ),
             const Spacer(),
           ],
 
-          if (_selecting) ...[
-            IconButton(onPressed: _toggleSelectAll,
+          // 选择态右侧按钮：桌面端在顶栏显示全部操作，移动端操作在 shell 底部条
+          if (_selecting && _isDesktop) ...[
+            IconButton(
+              onPressed: _toggleSelectAll,
+              icon: Icon(
+                _allSelected ? Icons.deselect : Icons.select_all,
+                size: AppIconSize.lg,
+                color: _allSelected ? c.brand : c.onSurfaceVariant,
+              ),
+              tooltip: _allSelected ? '取消全选' : '全选',
+            ),
+            IconButton(
+              onPressed: _favoriteSelected,
+              icon: Icon(
+                _selectedAllFavorite ? Icons.favorite : Icons.favorite_border,
+                size: AppIconSize.lg,
+                color: _selectedAllFavorite ? c.onSurface : c.onSurfaceVariant,
+              ),
+              tooltip: _selectedAllFavorite ? '取消收藏' : '收藏',
+            ),
+            IconButton(
+              onPressed: _moveSelected,
+              icon: Icon(
+                Icons.drive_file_move_outlined,
+                size: AppIconSize.lg,
+                color: c.onSurfaceVariant,
+              ),
+              tooltip: '移动',
+            ),
+            IconButton(
+              onPressed: _downloadSelected,
+              icon: Icon(
+                Icons.file_download_outlined,
+                size: AppIconSize.lg,
+                color: c.onSurfaceVariant,
+              ),
+              tooltip: '下载',
+            ),
+            IconButton(
+              onPressed: _deleteSelected,
+              icon: Icon(
+                Icons.delete_outline,
+                size: AppIconSize.lg,
+                color: c.error,
+              ),
+              tooltip: '删除',
+            ),
+          ] else if (!_selecting) ...[
+            if (_isDesktop && connected && _items.isNotEmpty)
+              IconButton(
+                onPressed: () {
+                  setState(() => _selecting = true);
+                  _syncSelection();
+                },
                 icon: Icon(
-                  _allSelected ? Icons.deselect : Icons.select_all,
+                  Icons.library_add_check_outlined,
                   size: AppIconSize.lg,
-                  color: _allSelected ? c.brand : c.onSurfaceVariant,
-                ), tooltip: _allSelected ? '取消全选' : '全选'),
-            IconButton(onPressed: _favoriteSelected,
-                icon: Icon(
-                  _selectedAllFavorite ? Icons.favorite : Icons.favorite_border,
-                  size: AppIconSize.lg,
-                  color: _selectedAllFavorite ? c.onSurface : c.onSurfaceVariant,
-                ), tooltip: _selectedAllFavorite ? '取消收藏' : '收藏'),
-            IconButton(onPressed: _moveSelected,
-                icon: Icon(Icons.drive_file_move_outlined, size: AppIconSize.lg, color: c.onSurfaceVariant), tooltip: '移动'),
-            IconButton(onPressed: _downloadSelected,
-                icon: Icon(Icons.file_download_outlined, size: AppIconSize.lg, color: c.onSurfaceVariant), tooltip: '下载'),
-            IconButton(onPressed: _deleteSelected,
-                icon: Icon(Icons.delete_outline, size: AppIconSize.lg, color: c.error), tooltip: '删除'),
-          ] else ...[
-            if (connected && _items.isNotEmpty)
-              IconButton(onPressed: () => setState(() => _selecting = true),
-                  icon: Icon(Icons.library_add_check_outlined, size: AppIconSize.lg, color: c.onSurfaceVariant), tooltip: '多选'),
-            if (connected)
-              IconButton(onPressed: _createFolder,
-                  icon: Icon(Icons.create_new_folder_outlined, size: AppIconSize.lg, color: c.onSurfaceVariant), tooltip: '新建文件夹'),
+                  color: c.onSurfaceVariant,
+                ),
+                tooltip: '多选',
+              ),
             if (connected)
               IconButton(
-                  onPressed: _showUploadSourceSheet,
-                  icon: Icon(Icons.upload_rounded, size: AppIconSize.lg,
-                      color: c.onSurfaceVariant), tooltip: '上传'),
-            IconButton(
-              onPressed: _openDisplaySettings,
-              icon: Stack(children: [
-                Icon(Icons.tune, size: AppIconSize.lg, color: c.onSurfaceVariant),
-                if (prefs.hasActiveFilter)
-                  Positioned(right: 0, top: 0,
-                      child: Container(width: 6, height: 6,
-                          decoration: BoxDecoration(color: c.brand, shape: BoxShape.circle))),
-              ]),
-              tooltip: '显示设置',
-            ),
+                onPressed: _openSortSettings,
+                icon: Icon(
+                  Icons.swap_vert_rounded,
+                  size: AppIconSize.lg,
+                  color: c.onSurfaceVariant,
+                ),
+                tooltip: '排序',
+              ),
+            if (connected)
+              IconButton(
+                onPressed: _openFilterSettings,
+                icon: Stack(
+                  children: [
+                    Icon(
+                      Icons.filter_alt_outlined,
+                      size: AppIconSize.lg,
+                      color: c.onSurfaceVariant,
+                    ),
+                    if (prefs.hasActiveFilter)
+                      Positioned(
+                        right: 0,
+                        top: 0,
+                        child: Container(
+                          width: 6,
+                          height: 6,
+                          decoration: BoxDecoration(
+                            color: c.brand,
+                            shape: BoxShape.circle,
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+                tooltip: '筛选',
+              ),
+            if (connected)
+              IconButton(
+                onPressed: _openDisplaySettings,
+                icon: Icon(
+                  Icons.view_module_outlined,
+                  size: AppIconSize.lg,
+                  color: c.onSurfaceVariant,
+                ),
+                tooltip: '展示设置',
+              ),
+            if (connected && widget.mode == GalleryMode.albums)
+              IconButton(
+                onPressed: _createFolder,
+                icon: Icon(
+                  Icons.create_new_folder_outlined,
+                  size: AppIconSize.lg,
+                  color: c.onSurfaceVariant,
+                ),
+                tooltip: '新建文件夹',
+              ),
+            if (connected && widget.mode == GalleryMode.albums)
+              IconButton(
+                onPressed: _embedded
+                    ? () => widget.shell!.pickAndUpload(
+                        folderId: _currentFolderId,
+                      )
+                    : _showUploadSourceSheet,
+                icon: Icon(
+                  Icons.upload_rounded,
+                  size: AppIconSize.lg,
+                  color: c.onSurfaceVariant,
+                ),
+                tooltip: '上传',
+              ),
           ],
         ],
       ),
     );
   }
 
-  // ── 顶栏下筛选 chips（YouTube 移动端风格）──
-  Widget _buildFilterChips(AppColors c, DisplayPrefs prefs) {
-    const options = <(MediaFilter, String)>[
-      (MediaFilter.all, '全部'),
-      (MediaFilter.photosOnly, '图片'),
-      (MediaFilter.videosOnly, '视频'),
-      (MediaFilter.favoritesOnly, '收藏'),
-    ];
-    return SizedBox(
-      height: 48,
-      child: ListView.separated(
-        scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-        itemCount: options.length,
-        separatorBuilder: (_, __) => const SizedBox(width: 10),
-        itemBuilder: (ctx, i) {
-          final (filter, label) = options[i];
-          final active = prefs.mediaFilter == filter;
-          return GestureDetector(
-            onTap: active
-                ? null
-                : () {
-                    prefs.setMediaFilter(filter);
-                    _onPrefsChanged(prefs);
-                  },
-            child: Container(
-              alignment: Alignment.center,
-              height: 36,
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              decoration: BoxDecoration(
-                color: active ? c.onSurface : c.surface2,
-                borderRadius: BorderRadius.circular(AppRadius.chip),
-              ),
-              child: Text(
-                label,
-                style: TextStyle(
-                  color: active ? c.bg : c.onSurface,
-                  fontSize: AppType.sm,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-            ),
-          );
-        },
-      ),
-    );
-  }
-
-  /// 顶栏里的路径，紧挨设置图标。两种形态：
-  ///  - 1 层：`首页 / 相册名`，两段都可点
-  ///  - 2 层以上：`… / 当前层`，点 `…` 弹出中间各层的下拉菜单
-  ///
-  /// 之所以不平铺所有层：顶栏宽度有限，深目录平铺必然挤掉右侧操作按钮
-  /// 或被截断。折叠成一个 `…` 是 Finder / VS Code 面包屑的通用做法。
-  /// 左上角头像 → 全局设置。
-  /// 取当前服务器名首字，底色跟连接状态走 —— 顺带当状态指示，
-  /// 不用再单独占一个位置显示"未连接/需令牌"。
+  // 左上角头像进入全局设置；移动端首字母圆点同时表达连接状态。
   Widget _buildAvatar(AppColors c, ServerState state) {
     final name = state.active?.name.trim() ?? '';
     return IconButton(
       onPressed: _openProfile,
       tooltip: name.isEmpty ? '设置' : '$name · 设置',
-      icon: Icon(Icons.person_outline,
-          size: AppIconSize.lg, color: c.onSurfaceVariant),
-    );
-  }
-
-  Widget _buildToolbarPath(AppColors c) {
-    final last = _folderPath.length - 1;
-    final style = TextStyle(
-      color: c.onSurfaceVariant,
-      fontSize: AppType.sm,
-      height: 1.2,
-    );
-    final sep = Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 5),
-      child: Text('/', style: style.copyWith(color: c.onMuted)),
-    );
-
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      crossAxisAlignment: CrossAxisAlignment.baseline,
-      textBaseline: TextBaseline.alphabetic,
-      children: [
-        if (_folderPath.length == 1)
-          _pathSegment('首页', style, () => _navigateToPathIndex(-1))
-        else
-          _buildPathMenu(c, style),
-        sep,
-        // 当前层：跟其它段用同一样式,不再加粗/加深
-        Flexible(
-          child: Text(
-            _folderPath[last].name,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: style,
-          ),
-        ),
-      ],
-    );
-  }
-
-  /// 折叠态的 `…`：点开列出 首页 + 所有中间层
-  Widget _buildPathMenu(AppColors c, TextStyle style) {
-    return PopupMenuButton<int>(
-      tooltip: '上级目录',
-      color: c.surface,
-      position: PopupMenuPosition.under,
-      padding: EdgeInsets.zero,
-      onSelected: _navigateToPathIndex,
-      itemBuilder: (_) => [
-        PopupMenuItem(value: -1, child: Row(children: [
-          Icon(Icons.home_outlined, size: AppIconSize.md, color: c.onSurfaceVariant),
-          const SizedBox(width: 10),
-          Text('首页', style: TextStyle(color: c.onSurface, fontSize: AppType.sm)),
-        ])),
-        // 不含最后一层 —— 那是当前所在层，已经显示在右边了
-        for (var i = 0; i < _folderPath.length - 1; i++)
-          PopupMenuItem(value: i, child: Padding(
-            // 逐级缩进，一眼看出层级关系
-            padding: EdgeInsets.only(left: 12.0 * (i + 1)),
-            child: Row(children: [
-              Icon(Icons.subdirectory_arrow_right, size: AppIconSize.sm, color: c.onMuted),
-              const SizedBox(width: 8),
-              Flexible(child: Text(_folderPath[i].name,
-                  maxLines: 1, overflow: TextOverflow.ellipsis,
-                  style: TextStyle(color: c.onSurface, fontSize: AppType.sm))),
-            ]),
-          )),
-      ],
-      child: Padding(
-        // PopupMenuButton 默认有 48px 最小点击区，会把 `…` 撑得很宽。
-        // 这里自己给一个够用的点击面积，不让它顶开右边的操作按钮。
-        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
-        child: Text('…', style: style.copyWith(
-          color: c.onSurfaceVariant,
-          fontSize: AppType.mdPlus,
-          fontWeight: FontWeight.w600,
-        )),
+      icon: Icon(
+        Icons.person_outline,
+        size: AppIconSize.lg,
+        color: c.onSurfaceVariant,
       ),
     );
   }
 
-  Widget _pathSegment(String label, TextStyle style, VoidCallback onTap) {
+  Widget _buildServerLabel(AppColors c, ServerState state) {
+    final connected = state.status == ConnectionStatus.connected;
+    final needAuth = state.status == ConnectionStatus.needAuth;
+    final name = state.active?.name.trim() ?? '';
+    final dotColor = connected ? c.ok : (needAuth ? c.warn : c.error);
+    final initial = name.isEmpty ? '' : name.characters.first.toUpperCase();
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 8),
+      child: Container(
+        width: 28,
+        height: 28,
+        decoration: BoxDecoration(
+          color: dotColor.withValues(alpha: 0.15),
+          shape: BoxShape.circle,
+          border: Border.all(color: dotColor, width: 1.5),
+        ),
+        child: Center(
+          child: Text(
+            initial,
+            style: TextStyle(
+              color: dotColor,
+              fontSize: 12,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildBreadcrumbs(AppColors c) {
+    final last = _folderPath.length - 1;
+    final entries = <({int index, String label, bool current, bool ellipsis})>[
+      (index: -1, label: '首页', current: false, ellipsis: false),
+    ];
+
+    if (_breadcrumbExpanded || _folderPath.length <= 2) {
+      for (var i = 0; i < _folderPath.length; i++) {
+        entries.add((
+          index: i,
+          label: _folderPath[i].name,
+          current: i == last,
+          ellipsis: false,
+        ));
+      }
+    } else {
+      entries.add((index: -2, label: '…', current: false, ellipsis: true));
+      entries.add((
+        index: last - 1,
+        label: _folderPath[last - 1].name,
+        current: false,
+        ellipsis: false,
+      ));
+      entries.add((
+        index: last,
+        label: _folderPath[last].name,
+        current: true,
+        ellipsis: false,
+      ));
+    }
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(
+        AppSpace.lg,
+        AppSpace.md,
+        AppSpace.lg,
+        AppSpace.sm,
+      ),
+      child: Wrap(
+        spacing: AppSpace.xs,
+        runSpacing: AppSpace.sm,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: [
+          for (var i = 0; i < entries.length; i++)
+            if (i == 0)
+              _breadcrumbSegment(c, entries[i])
+            else
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    Icons.chevron_right,
+                    size: AppIconSize.sm,
+                    color: c.onMuted,
+                  ),
+                  const SizedBox(width: 2),
+                  _breadcrumbSegment(c, entries[i]),
+                ],
+              ),
+        ],
+      ),
+    );
+  }
+
+  Widget _breadcrumbSegment(
+    AppColors c,
+    ({int index, String label, bool current, bool ellipsis}) entry,
+  ) {
     return GestureDetector(
-      onTap: onTap,
       behavior: HitTestBehavior.opaque,
-      child: Text(label, maxLines: 1, overflow: TextOverflow.ellipsis, style: style),
+      onTap: () {
+        if (entry.ellipsis) {
+          setState(() => _breadcrumbExpanded = true);
+          return;
+        }
+        if (entry.current) {
+          if (_breadcrumbExpanded) {
+            setState(() => _breadcrumbExpanded = false);
+          }
+          return;
+        }
+        _navigateToPathIndex(entry.index);
+      },
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 220, minHeight: 40),
+        child: Container(
+          alignment: Alignment.center,
+          padding: const EdgeInsets.symmetric(horizontal: AppSpace.md),
+          decoration: BoxDecoration(
+            color: entry.current
+                ? c.onSurface
+                : entry.ellipsis
+                ? c.brandSoft
+                : c.surface2,
+            borderRadius: BorderRadius.circular(AppRadius.chip),
+          ),
+          child: Text(
+            entry.label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: entry.current ? c.onScrim : c.onSurface,
+              fontSize: AppType.xs,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ),
+      ),
     );
   }
 
   Widget _buildDownloadBar(AppColors c) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-      child: Row(children: [
-        SizedBox(width: 14, height: 14,
-            child: CircularProgressIndicator(strokeWidth: 2, color: c.brand,
-                value: _downloadTotal > 0 ? _downloadCompleted / _downloadTotal : null)),
-        const SizedBox(width: 10),
-        Text('下载中 $_downloadCompleted / $_downloadTotal',
-            style: TextStyle(color: c.onSurfaceVariant, fontSize: AppType.xs)),
-      ]),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 14,
+            height: 14,
+            child: CircularProgressIndicator(
+              strokeWidth: 2,
+              color: c.brand,
+              value: _downloadTotal > 0
+                  ? _downloadCompleted / _downloadTotal
+                  : null,
+            ),
+          ),
+          const SizedBox(width: 10),
+          Text(
+            '下载中 $_downloadCompleted / $_downloadTotal',
+            style: TextStyle(color: c.onSurfaceVariant, fontSize: AppType.xs),
+          ),
+        ],
+      ),
     );
   }
 
@@ -1419,23 +1837,53 @@ class _GalleryViewState extends State<GalleryView>
       return AppEmptyState(
         icon: needAuth ? Icons.vpn_key_outlined : Icons.wifi_off,
         message: needAuth ? '服务器需要访问令牌' : '未连接到服务器',
-        action: AppButton(label: needAuth ? '输入令牌' : '去连接', onTap: _openProfile),
+        action: AppButton(
+          label: needAuth ? '输入令牌' : '去连接',
+          onTap: _openProfile,
+        ),
       );
     }
 
     if (_items.isEmpty && !_loading && _folders.isEmpty) {
-      return RefreshIndicator(
-        onRefresh: _refresh, color: c.brand,
-        child: ListView(children: [
-          const SizedBox(height: 120),
-          AppEmptyState(
-            icon: Icons.photo_library_outlined,
-            message: prefs.hasActiveFilter ? '没有匹配的项目' : '还没有照片',
-            action: prefs.hasActiveFilter
-                ? AppButton(label: '清除筛选', onTap: () { prefs.clearFilters(); _refresh(); }, primary: false)
-                : AppButton(label: '上传照片', icon: Icons.add, onTap: _showUploadSourceSheet),
+      return AppScrollbar(
+        controller: _scrollCtrl,
+        child: RefreshIndicator(
+          onRefresh: _refresh,
+          color: c.brand,
+          child: ListView(
+            controller: _scrollCtrl,
+            physics: const AlwaysScrollableScrollPhysics(),
+            children: [
+              if (_folderPath.isNotEmpty && widget.mode == GalleryMode.albums)
+                _buildBreadcrumbs(c),
+              const SizedBox(height: 120),
+              AppEmptyState(
+                icon: Icons.photo_library_outlined,
+                message: prefs.hasActiveFilter ? '没有匹配的项目' : '还没有照片',
+                action: prefs.hasActiveFilter
+                    ? AppButton(
+                        label: '清除筛选',
+                        onTap: () {
+                          prefs.clearFilters();
+                          _onPrefsChanged(prefs);
+                        },
+                        primary: false,
+                      )
+                    : widget.mode == GalleryMode.albums
+                    ? AppButton(
+                        label: '上传照片',
+                        icon: Icons.add,
+                        onTap: _embedded
+                            ? () => widget.shell!.pickAndUpload(
+                                folderId: _currentFolderId,
+                              )
+                            : _showUploadSourceSheet,
+                      )
+                    : null,
+              ),
+            ],
           ),
-        ]),
+        ),
       );
     }
 
@@ -1447,183 +1895,280 @@ class _GalleryViewState extends State<GalleryView>
 
     return GestureDetector(
       // 到这里已经过了上面的未连接早退，必然是 connected
-      onSecondaryTapDown: _isDesktop ? (d) => _showGridContextMenu(d.globalPosition, c) : null,
+      onSecondaryTapDown: _isDesktop
+          ? (d) => _showGridContextMenu(d.globalPosition, c)
+          : null,
       child: Listener(
-      // 自己数指针，而不是靠 ScaleGestureRecognizer：后者要和 ScrollView 的
-      // VerticalDrag 抢竞技场，drag 经常先赢 —— 体感就是"双指缩放变成了上下滚动"。
-      // 数到 2 指就把 physics 换成 NeverScrollable，scroll 直接退出竞争。
-      onPointerDown: (e) {
-        _activePointers.add(e.pointer);
-        _pointerPos[e.pointer] = e.position;
-        if (_activePointers.length == 2) {
-          _pinchStartDist = _pointerDistance();
-          setState(() => _pinchScale = 1.0);
-        }
-      },
-      onPointerMove: (e) {
-        _pointerPos[e.pointer] = e.position;
-        if (_activePointers.length >= 2 && _pinchStartDist > 0) {
-          final d = _pointerDistance();
-          if (d > 0) setState(() => _pinchScale = d / _pinchStartDist);
-        }
-      },
-      onPointerUp: (e) => _endPinch(e.pointer, prefs),
-      onPointerCancel: (e) => _endPinch(e.pointer, prefs),
-      child: ScrollConfiguration(
-      behavior: ScrollConfiguration.of(context).copyWith(
-        physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
-      ),
-      child: RefreshIndicator(
-      onRefresh: _refresh, color: c.brand,
-      notificationPredicate: (_) => true,
-      child: DragSelectDetector(
-        enabled: _selecting,
-        onStart: _sweepStart,
-        onEnter: _sweepTo,
-        onEnd: _sweepEnd,
-        scrollController: _scrollCtrl,
-        child: LayoutBuilder(builder: (ctx, box) {
-        // 格子高 = 列宽 + 标签高。用实测列宽算，不写死 childAspectRatio ——
-        // 写死的比例在列宽或标签行数变化时会让标签放不下（RenderFlex overflowed）。
-        const gridPad = 16.0, crossGap = 14.0;
-        final usable = box.maxWidth - gridPad * 2;
-        final mediaCol = (usable - crossGap * (prefs.gridColumns - 1)) / prefs.gridColumns;
-        final mediaLabel = labelExtent(prefs);
-        final mediaRatio = mediaCol / (mediaCol + mediaLabel);
-
-        // 文件夹网格走 maxCrossAxisExtent，列数由框架算，这里复现同一套规则
-        final folderCols = (usable / 150).ceil().clamp(1, 99);
-        final folderCol = (usable - crossGap * (folderCols - 1)) / folderCols;
-        final folderRatio = folderCol / (folderCol + folderLabelExtent);
-
-        return _pinchWrap(CustomScrollView(
-        controller: _scrollCtrl,
-        physics: _pinching
-            ? const NeverScrollableScrollPhysics()
-            : const AlwaysScrollableScrollPhysics(),
-        slivers: [
-          // 面包屑 + 搜索框：都躺在内容里，不占顶栏。
-          // 用 SliverOpacity 而不是 `if (...)` 增删 sliver —— 增删会让后续
-          // sliver 整体位移，滚动位置跟着乱跳。
-          _buildInlineHeader(c),
-          // folders section
-          if (_folders.isNotEmpty) ...[
-            SliverToBoxAdapter(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(16, 24, 16, 12),
-                child: Text('文件夹',
-                    style: TextStyle(color: c.onSurface, fontSize: AppType.mdPlus,
-                        fontWeight: FontWeight.w700, letterSpacing: -0.3)),
-              ),
+        // 自己数指针，而不是靠 ScaleGestureRecognizer：后者要和 ScrollView 的
+        // VerticalDrag 抢竞技场，drag 经常先赢 —— 体感就是"双指缩放变成了上下滚动"。
+        // 数到 2 指就把 physics 换成 NeverScrollable，scroll 直接退出竞争。
+        onPointerDown: (e) {
+          _activePointers.add(e.pointer);
+          _pointerPos[e.pointer] = e.position;
+          if (_activePointers.length == 2) {
+            _pinchStartDist = _pointerDistance();
+            setState(() => _pinchScale = 1.0);
+          }
+        },
+        onPointerMove: (e) {
+          _pointerPos[e.pointer] = e.position;
+          if (_activePointers.length >= 2 && _pinchStartDist > 0) {
+            final d = _pointerDistance();
+            if (d > 0) setState(() => _pinchScale = d / _pinchStartDist);
+          }
+        },
+        onPointerUp: (e) => _endPinch(e.pointer, prefs),
+        onPointerCancel: (e) => _endPinch(e.pointer, prefs),
+        child: ScrollConfiguration(
+          behavior: ScrollConfiguration.of(context).copyWith(
+            physics: const BouncingScrollPhysics(
+              parent: AlwaysScrollableScrollPhysics(),
             ),
-            SliverPadding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              sliver: SliverGrid(
-                gridDelegate: SliverGridDelegateWithMaxCrossAxisExtent(
-                  maxCrossAxisExtent: 150,
-                  mainAxisSpacing: 16, crossAxisSpacing: crossGap,
-                  childAspectRatio: folderRatio,
-                ),
-                delegate: SliverChildBuilderDelegate(
-                  (ctx, i) => FolderThumb(
-                    key: ValueKey(_folders[i].id),
-                    folder: _folders[i],
-                    service: _service!,
-                    onTap: () => _enterFolder(_folders[i]),
-                    onLongPress: () => _showFolderActions(_folders[i]),
-                  ),
-                  childCount: _folders.length,
-                ),
-              ),
-            ),
-          ],
-          // media section
-          for (final group in groups) ...[
-            if (group.label.isNotEmpty)
-              SliverToBoxAdapter(
-                child: GestureDetector(
-                  behavior: _selecting ? HitTestBehavior.opaque : HitTestBehavior.deferToChild,
-                  onTap: _selecting ? () => _toggleGroupSelect(group) : null,
-                  child: Padding(
-                    padding: const EdgeInsets.fromLTRB(16, 28, 16, 12),
-                    child: Row(children: [
-                      Text(group.label,
-                          style: TextStyle(color: c.onSurface, fontSize: AppType.mdPlus,
-                              fontWeight: FontWeight.w700, letterSpacing: -0.3)),
-                      const Spacer(),
-                      if (_selecting)
-                        Icon(
-                          group.items.every((m) => _selected.contains(m.id))
-                              ? Icons.check_box : Icons.check_box_outline_blank,
-                          size: AppIconSize.lg,
-                          color: group.items.every((m) => _selected.contains(m.id))
-                              ? c.brand : c.onMuted,
-                        ),
-                    ]),
-                  ),
-                ),
-              ),
-            SliverPadding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              sliver: SliverGrid(
-                gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                  crossAxisCount: prefs.gridColumns,
-                  mainAxisSpacing: 16, crossAxisSpacing: crossGap,
-                  childAspectRatio: mediaRatio,
-                ),
-                delegate: SliverChildBuilderDelegate(
-                  (ctx, i) => DragSelectItem(
-                    index: indexOfId[group.items[i].id] ?? -1,
-                    child: MediaThumb(
-                    key: ValueKey(group.items[i].id),
-                    item: group.items[i], service: _service!,
-                    selected: _selected.contains(group.items[i].id),
-                    selecting: _selecting, prefs: prefs,
-                    onTap: () {
-                      if (_selecting) { _toggleSelect(group.items[i].id); }
-                      else { setState(() => _viewerIndex = _items.indexOf(group.items[i])); }
-                    },
-                    onLongPress: () {
-                      if (!_selecting) setState(() => _selecting = true);
-                      _toggleSelect(group.items[i].id);
-                    },
-                    onSecondaryTap: _isDesktop && !_selecting
-                        ? (pos) => _showItemContextMenu(pos, group.items[i], c)
-                        : null,
+          ),
+          child: RefreshIndicator(
+            onRefresh: _refresh,
+            color: c.brand,
+            notificationPredicate: (_) => true,
+            child: DragSelectDetector(
+              enabled: _selecting,
+              onStart: _sweepStart,
+              onEnter: _sweepTo,
+              onEnd: _sweepEnd,
+              scrollController: _scrollCtrl,
+              child: LayoutBuilder(
+                builder: (ctx, box) {
+                  // 格子高 = 列宽 + 标签高。用实测列宽算，不写死 childAspectRatio ——
+                  // 写死的比例在列宽或标签行数变化时会让标签放不下（RenderFlex overflowed）。
+                  const gridPad = 16.0, crossGap = 14.0;
+                  final usable = box.maxWidth - gridPad * 2;
+                  final mediaCol =
+                      (usable - crossGap * (prefs.gridColumns - 1)) /
+                      prefs.gridColumns;
+                  final mediaLabel = labelExtent(prefs);
+                  final mediaRatio = mediaCol / (mediaCol + mediaLabel);
+
+                  return _pinchWrap(
+                    AppScrollbar(
+                      controller: _scrollCtrl,
+                      child: CustomScrollView(
+                        controller: _scrollCtrl,
+                        scrollCacheExtent: const ScrollCacheExtent.pixels(600),
+                        physics: _pinching
+                            ? const NeverScrollableScrollPhysics()
+                            : const AlwaysScrollableScrollPhysics(),
+                        slivers: [
+                          if (_folderPath.isNotEmpty &&
+                              widget.mode == GalleryMode.albums)
+                            SliverToBoxAdapter(child: _buildBreadcrumbs(c)),
+                          if (_folders.isNotEmpty &&
+                              widget.mode == GalleryMode.albums) ...[
+                            SliverList(
+                              delegate: SliverChildBuilderDelegate(
+                                (ctx, i) => _FolderListTile(
+                                  key: ValueKey(_folders[i].id),
+                                  name: _folders[i].name,
+                                  coverId: _folders[i].coverId,
+                                  itemCount: _folders[i].itemCount,
+                                  service: _service!,
+                                  onTap: () => _enterFolder(_folders[i]),
+                                  onLongPress: () =>
+                                      _showFolderActions(_folders[i]),
+                                ),
+                                childCount: _folders.length,
+                              ),
+                            ),
+                            if (_folders.isNotEmpty && _items.isNotEmpty)
+                              SliverToBoxAdapter(
+                                child: Divider(height: 1, color: c.outline),
+                              ),
+                          ],
+                          // media section
+                          for (final group in groups) ...[
+                            if (group.label.isNotEmpty)
+                              SliverToBoxAdapter(
+                                child: GestureDetector(
+                                  behavior: _selecting
+                                      ? HitTestBehavior.opaque
+                                      : HitTestBehavior.deferToChild,
+                                  onTap: _selecting
+                                      ? () => _toggleGroupSelect(group)
+                                      : null,
+                                  child: Padding(
+                                    padding: const EdgeInsets.fromLTRB(
+                                      16,
+                                      32,
+                                      16,
+                                      14,
+                                    ),
+                                    child: Row(
+                                      children: [
+                                        Text(
+                                          group.label,
+                                          style: TextStyle(
+                                            color: c.onSurface,
+                                            fontSize: AppType.mdPlus,
+                                            fontWeight: FontWeight.w700,
+                                            letterSpacing: -0.3,
+                                          ),
+                                        ),
+                                        const Spacer(),
+                                        if (_selecting)
+                                          Icon(
+                                            group.items.every(
+                                                  (m) =>
+                                                      _selected.contains(m.id),
+                                                )
+                                                ? Icons.check_box
+                                                : Icons.check_box_outline_blank,
+                                            size: AppIconSize.lg,
+                                            color:
+                                                group.items.every(
+                                                  (m) =>
+                                                      _selected.contains(m.id),
+                                                )
+                                                ? c.brand
+                                                : c.onMuted,
+                                          ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            SliverPadding(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 16,
+                              ),
+                              sliver: SliverGrid(
+                                gridDelegate:
+                                    SliverGridDelegateWithFixedCrossAxisCount(
+                                      crossAxisCount: prefs.gridColumns,
+                                      mainAxisSpacing: 16,
+                                      crossAxisSpacing: crossGap,
+                                      childAspectRatio: mediaRatio,
+                                    ),
+                                delegate: SliverChildBuilderDelegate(
+                                  (ctx, i) => DragSelectItem(
+                                    index: indexOfId[group.items[i].id] ?? -1,
+                                    child: MediaThumb(
+                                      key: ValueKey(group.items[i].id),
+                                      item: group.items[i],
+                                      service: _service!,
+                                      selected: _selected.contains(
+                                        group.items[i].id,
+                                      ),
+                                      selecting: _selecting,
+                                      prefs: prefs,
+                                      onTap: () {
+                                        if (_selecting) {
+                                          _toggleSelect(group.items[i].id);
+                                        } else {
+                                          _openViewer(
+                                            _items.indexOf(group.items[i]),
+                                          );
+                                        }
+                                      },
+                                      onLongPress: () {
+                                        if (!_selecting) {
+                                          setState(() => _selecting = true);
+                                        }
+                                        _toggleSelect(
+                                          group.items[i].id,
+                                        ); // _syncSelection called inside
+                                      },
+                                      onSecondaryTap: _isDesktop && !_selecting
+                                          ? (pos) => _showItemContextMenu(
+                                              pos,
+                                              group.items[i],
+                                              c,
+                                            )
+                                          : null,
+                                    ),
+                                  ),
+                                  childCount: group.items.length,
+                                ),
+                              ),
+                            ),
+                          ],
+                          if (_loading && _items.isNotEmpty)
+                            SliverToBoxAdapter(
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 16,
+                                  vertical: 16,
+                                ),
+                                child: Row(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    SizedBox(
+                                      width: 14,
+                                      height: 14,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                        color: c.brand,
+                                      ),
+                                    ),
+                                    const SizedBox(width: 10),
+                                    Text(
+                                      '加载中 ${_items.length} / $_total',
+                                      style: TextStyle(
+                                        color: c.onMuted,
+                                        fontSize: AppType.xs,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          if (_loading && _items.isEmpty)
+                            const SliverToBoxAdapter(
+                              child: Padding(
+                                padding: EdgeInsets.all(24),
+                                child: AppSpinner(),
+                              ),
+                            ),
+                          if (_paginationBlocked && _items.isNotEmpty)
+                            SliverToBoxAdapter(
+                              child: Padding(
+                                padding: const EdgeInsets.all(AppSpace.lg),
+                                child: Center(
+                                  child: Text(
+                                    '加载已暂停，下拉刷新后重试',
+                                    style: TextStyle(
+                                      color: c.onMuted,
+                                      fontSize: AppType.xs,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            )
+                          else if (!_hasMore && _items.isNotEmpty)
+                            SliverToBoxAdapter(
+                              child: Padding(
+                                padding: const EdgeInsets.all(AppSpace.lg),
+                                child: Center(
+                                  child: Text(
+                                    '已加载全部 $_total 项',
+                                    style: TextStyle(
+                                      color: c.onMuted,
+                                      fontSize: AppType.xs,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          SliverToBoxAdapter(
+                            child: SizedBox(height: _isDesktop ? 24 : 88),
+                          ),
+                        ],
+                      ),
                     ),
-                  ),
-                  childCount: group.items.length,
-                ),
+                  );
+                },
               ),
             ),
-          ],
-          if (_loading && _items.isNotEmpty)
-            SliverToBoxAdapter(child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
-              child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-                SizedBox(width: 14, height: 14,
-                    child: CircularProgressIndicator(strokeWidth: 2, color: c.brand)),
-                const SizedBox(width: 10),
-                Text('加载中 ${_items.length} / $_total',
-                    style: TextStyle(color: c.onMuted, fontSize: AppType.xs)),
-              ]),
-            )),
-          if (_loading && _items.isEmpty)
-            const SliverToBoxAdapter(child: Padding(padding: EdgeInsets.all(24), child: AppSpinner())),
-          if (!_hasMore && _items.isNotEmpty)
-            SliverToBoxAdapter(child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Center(child: Text('已加载全部 $_total 项',
-                  style: TextStyle(color: c.onMuted, fontSize: AppType.xs))),
-            )),
-          const SliverToBoxAdapter(child: SizedBox(height: 24)),
-        ],
-      ));
-      }),
+          ),
+        ),
       ),
-    ),
-    ),
-    ),
     );
   }
 
@@ -1644,8 +2189,10 @@ class _GalleryViewState extends State<GalleryView>
     if (_pinching) {
       scale = _pinchScale.clamp(0.5, 2.0);
     } else if (_settleCtrl.isAnimating) {
-      scale = _settleFrom + (1.0 - _settleFrom) * Curves.easeOutCubic
-          .transform(_settleCtrl.value);
+      scale =
+          _settleFrom +
+          (1.0 - _settleFrom) *
+              Curves.easeOutCubic.transform(_settleCtrl.value);
     } else {
       scale = 1.0;
     }
@@ -1680,8 +2227,8 @@ class _GalleryViewState extends State<GalleryView>
     final newCols = s > 1.25
         ? (oldCols - 1).clamp(1, 6)
         : s < 0.8
-            ? (oldCols + 1).clamp(1, 6)
-            : oldCols;
+        ? (oldCols + 1).clamp(1, 6)
+        : oldCols;
 
     if (newCols == oldCols) {
       // 没跨档：直接弹回原状
@@ -1703,5 +2250,224 @@ class _GalleryViewState extends State<GalleryView>
 
 enum _DownloadMode { direct, zip }
 
-// ── 分组：见 gallery_groups.dart ──
+// ── 相册列表行 ──
 
+class _FolderListTile extends StatelessWidget {
+  final String name;
+  final String? coverId;
+  final int? itemCount;
+  final MediaService service;
+  final VoidCallback onTap;
+  final VoidCallback? onLongPress;
+
+  const _FolderListTile({
+    super.key,
+    required this.name,
+    this.coverId,
+    this.itemCount,
+    required this.service,
+    required this.onTap,
+    this.onLongPress,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.colors;
+    return InkWell(
+      onTap: onTap,
+      onLongPress: onLongPress,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        child: Row(
+          children: [
+            // 封面缩略图或图标
+            ClipRRect(
+              borderRadius: BorderRadius.circular(AppRadius.card),
+              child: SizedBox(
+                width: 60,
+                height: 60,
+                child: coverId != null
+                    ? CachedThumb(
+                        id: coverId!,
+                        url: service.thumbUrl(coverId!),
+                        headers: service.authHeaders,
+                      )
+                    : Container(
+                        color: c.surface2,
+                        child: Icon(
+                          Icons.folder_outlined,
+                          color: c.onMuted,
+                          size: AppIconSize.xl,
+                        ),
+                      ),
+              ),
+            ),
+            const SizedBox(width: 14),
+            // 名称 + 子标题
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    name,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: c.onSurface,
+                      fontSize: AppType.sm,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    itemCount != null ? '$itemCount 项' : '',
+                    style: TextStyle(color: c.onMuted, fontSize: AppType.xs),
+                  ),
+                ],
+              ),
+            ),
+            Icon(Icons.chevron_right, color: c.onMuted, size: AppIconSize.lg),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ── 上传遮罩 ──
+
+class _UploadOverlay extends StatefulWidget {
+  final VoidCallback onHide;
+  const _UploadOverlay({required this.onHide});
+
+  @override
+  State<_UploadOverlay> createState() => _UploadOverlayState();
+}
+
+class _UploadOverlayState extends State<_UploadOverlay> {
+  @override
+  void initState() {
+    super.initState();
+    UploadManager.instance.addListener(_onChange);
+  }
+
+  @override
+  void dispose() {
+    UploadManager.instance.removeListener(_onChange);
+    super.dispose();
+  }
+
+  void _onChange() {
+    if (mounted) setState(() {});
+  }
+
+  String _fmtBytes(double bytes) {
+    if (bytes < 1024) return '${bytes.toStringAsFixed(0)} B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    if (bytes < 1024 * 1024 * 1024) {
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
+  }
+
+  String _fmtEta(Duration d) {
+    if (d.inHours > 0) return '${d.inHours}h${d.inMinutes.remainder(60)}m';
+    if (d.inMinutes > 0) return '${d.inMinutes}m${d.inSeconds.remainder(60)}s';
+    return '${d.inSeconds}s';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.colors;
+    final m = UploadManager.instance;
+    final uploading = m.uploading;
+    final progress = m.progress;
+    final speed = m.speedBps;
+    final eta = m.eta;
+
+    return Positioned.fill(
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () {},
+        child: ColoredBox(
+          color: c.scrimSoft,
+          child: Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SizedBox(
+                  width: 56,
+                  height: 56,
+                  child: CircularProgressIndicator(
+                    value: uploading ? progress.clamp(0, 1).toDouble() : null,
+                    strokeWidth: 4,
+                    color: c.brand,
+                    backgroundColor: c.outline,
+                  ),
+                ),
+                const SizedBox(height: 16),
+                if (!uploading)
+                  Text(
+                    '正在准备上传…',
+                    style: TextStyle(
+                      color: c.onSurfaceVariant,
+                      fontSize: AppType.sm,
+                    ),
+                  )
+                else ...[
+                  Text(
+                    '${m.completed}/${m.total}  ${(progress * 100).toStringAsFixed(0)}%',
+                    style: TextStyle(
+                      color: c.onSurface,
+                      fontSize: AppType.mdPlus,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  if (speed > 0)
+                    Text(
+                      '${_fmtBytes(speed)}/s${eta != null ? '  ETA ${_fmtEta(eta)}' : ''}',
+                      style: TextStyle(color: c.onMuted, fontSize: AppType.xs),
+                    ),
+                  const SizedBox(height: 20),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      OutlinedButton(
+                        onPressed: m.cancelling ? null : m.cancel,
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: c.error,
+                          side: BorderSide(
+                            color: c.error.withValues(alpha: 0.5),
+                          ),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(AppRadius.chip),
+                          ),
+                        ),
+                        child: Text(m.cancelling ? '正在取消…' : '取消上传'),
+                      ),
+                      const SizedBox(width: 12),
+                      FilledButton(
+                        onPressed: widget.onHide,
+                        style: FilledButton.styleFrom(
+                          backgroundColor: c.brand,
+                          foregroundColor: c.onScrim,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(AppRadius.chip),
+                          ),
+                        ),
+                        child: const Text('后台上传'),
+                      ),
+                    ],
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ── 分组：见 gallery_groups.dart ──

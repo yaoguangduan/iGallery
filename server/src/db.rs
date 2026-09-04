@@ -24,6 +24,13 @@ pub async fn init_pool(data_dir: &Path) -> Result<SqlitePool, sqlx::Error> {
     sqlx::query(SCHEMA).execute(&pool).await?;
     sqlx::query(FOLDERS_SCHEMA).execute(&pool).await?;
 
+    // 一次性迁移：把历史 taken_at=NULL 的行补上 created_at。
+    // 排序 NULLS LAST 会让 NULL 行永远沉底,用户看不见。幂等,再次启动是空扫。
+    sqlx::query(
+        "UPDATE media SET taken_at = created_at \
+         WHERE taken_at IS NULL AND deleted_at IS NULL"
+    ).execute(&pool).await.ok();
+
     for idx in INDEXES {
         sqlx::query(idx).execute(&pool).await.ok();
     }
@@ -260,6 +267,35 @@ pub async fn find_by_checksum(pool: &SqlitePool, checksum: &str) -> Result<Optio
     )).bind(checksum).fetch_optional(pool).await
 }
 
+pub async fn list_all_checksums(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Error> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT checksum FROM media \
+         WHERE checksum IS NOT NULL AND deleted_at IS NULL \
+           AND length(checksum) = 32 AND checksum NOT GLOB '*[^0-9a-f]*'"
+    ).fetch_all(pool).await?;
+    Ok(rows.into_iter().map(|r| r.0).collect())
+}
+
+pub async fn list_legacy_checksums_after(
+    pool: &SqlitePool,
+    after_id: &str,
+    limit: i64,
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, ext FROM media \
+         WHERE id > ? AND (checksum IS NULL OR length(checksum) != 32 \
+           OR checksum GLOB '*[^0-9a-f]*') \
+         ORDER BY id ASC LIMIT ?"
+    ).bind(after_id).bind(limit).fetch_all(pool).await?;
+    Ok(rows)
+}
+
+pub async fn set_checksum(pool: &SqlitePool, id: &str, checksum: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE media SET checksum = ? WHERE id = ?")
+        .bind(checksum).bind(id).execute(pool).await?;
+    Ok(())
+}
+
 pub async fn count_active(pool: &SqlitePool) -> i64 {
     sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM media WHERE deleted_at IS NULL")
         .fetch_one(pool).await.map(|r| r.0).unwrap_or(0)
@@ -337,6 +373,28 @@ pub async fn rename_folder(pool: &SqlitePool, id: &str, name: &str) -> Result<bo
     let r = sqlx::query("UPDATE folders SET name = ?, updated_at = ? WHERE id = ?")
         .bind(name).bind(&now).bind(id).execute(pool).await?;
     Ok(r.rows_affected() > 0)
+}
+
+pub async fn move_folder(pool: &SqlitePool, id: &str, parent_id: Option<&str>) -> Result<bool, sqlx::Error> {
+    let now = now_rfc3339();
+    let r = sqlx::query("UPDATE folders SET parent_id = ?, updated_at = ? WHERE id = ?")
+        .bind(parent_id).bind(&now).bind(id).execute(pool).await?;
+    Ok(r.rows_affected() > 0)
+}
+
+pub async fn is_descendant_of(pool: &SqlitePool, folder_id: &str, ancestor_id: &str) -> Result<bool, sqlx::Error> {
+    let mut current = Some(folder_id.to_string());
+    let mut depth = 0;
+    while let Some(ref cid) = current {
+        if cid == ancestor_id { return Ok(true); }
+        depth += 1;
+        if depth > 256 { break; }
+        match get_folder(pool, cid).await? {
+            Some(row) => current = row.parent_id,
+            None => break,
+        }
+    }
+    Ok(false)
 }
 
 pub async fn delete_folder(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {

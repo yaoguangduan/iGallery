@@ -159,14 +159,13 @@ class _HistoryRow extends StatelessWidget {
                 style: TextStyle(color: c.onMuted, fontSize: AppType.xxs)),
           ],
         )),
-        // 单条删除：不用每删一条都弹确认框，删本地记录无后果，
-        // 弹框反而打断。真删错有"清空"之外的入口可查。
-        IconButton(
-          onPressed: onDelete,
-          icon: Icon(Icons.close, size: AppIconSize.sm, color: c.onMuted),
-          visualDensity: VisualDensity.compact,
-          tooltip: '删除这条记录',
-        ),
+        if (item.status != UploadStatus.pending)
+          IconButton(
+            onPressed: onDelete,
+            icon: Icon(Icons.close, size: AppIconSize.sm, color: c.onMuted),
+            visualDensity: VisualDensity.compact,
+            tooltip: '删除这条记录',
+          ),
       ]),
     );
   }

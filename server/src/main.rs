@@ -14,8 +14,10 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tower_http::cors::CorsLayer;
 use tower_http::timeout::TimeoutLayer;
+use xxhash_rust::xxh3::Xxh3;
 
 #[derive(Parser)]
 #[command(name = "igallery-server", about = "iGallery 局域网相册服务")]
@@ -123,10 +125,11 @@ async fn main() {
         .route("/v1/media/batch-delete", routing::post(media::batch_delete))
         .route("/v1/media/batch-move",  routing::post(media::batch_move))
         .route("/v1/media/batch-favorite", routing::post(media::batch_favorite))
+        .route("/v1/media/checksums",     routing::get(media::list_checksums).post(media::check_hashes))
         .route("/v1/media/{id}",        routing::delete(media::delete_media).patch(media::update_media))
         .route("/v1/media/{id}/restore", routing::post(media::restore_media))
         .route("/v1/folders",           routing::get(folder::list_folders).post(folder::create_folder))
-        .route("/v1/folders/{id}",      routing::get(folder::get_folder).patch(folder::rename_folder).delete(folder::delete_folder))
+        .route("/v1/folders/{id}",      routing::get(folder::get_folder).patch(folder::patch_folder).delete(folder::delete_folder))
         .route("/v1/folders/{id}/ancestors", routing::get(folder::get_ancestors))
         .route("/v1/auth",              routing::get(auth::auth_probe))
         .route("/v1/info",              routing::get(media::server_info))
@@ -153,7 +156,7 @@ async fn main() {
         .with_state(state);
 
     let addr = format!("0.0.0.0:{port}");
-    tracing::info!("iGallery server listening on {addr}");
+    tracing::info!("iGallery server preparing {addr}");
     tracing::info!("  data:   {}", data_dir.display());
     tracing::info!("  media:  {}", media_dir.display());
     tracing::info!("  thumbs: {}", thumbs_dir.display());
@@ -164,11 +167,17 @@ async fn main() {
     }
     thumb::probe_toolchain();
 
+    // 监听前完成一次旧 SHA/空 checksum 迁移，避免混合算法期间秒传漏判并产生重复文件。
+    if !migrate_legacy_checksums(&pool_for_purge, &media_dir).await {
+        tracing::error!("checksum migration failed; server will not accept requests");
+        return;
+    }
+
     // 后台定期清理"删除超过 30 天"的条目（回收站语义：期内可 restore）。
-    // 用 state 之前的那份 pool/路径，state 已经交给 router 了。
     tokio::spawn(purge_loop(pool_for_purge, media_dir.clone(), thumbs_dir.clone()));
 
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
+    tracing::info!("iGallery server listening on {addr}");
     axum::serve(listener, app).await.expect("serve");
 }
 
@@ -201,6 +210,69 @@ async fn purge_loop(pool: sqlx::SqlitePool, media_dir: PathBuf, thumbs_dir: Path
     }
 }
 
+async fn migrate_legacy_checksums(
+    pool: &sqlx::SqlitePool,
+    media_dir: &std::path::Path,
+) -> bool {
+    const BUFFER_SIZE: usize = 1024 * 1024;
+    let mut after_id = String::new();
+    let mut migrated = 0usize;
+    let mut read_failed = 0usize;
+    let mut db_failed = 0usize;
+
+    loop {
+        let batch = match db::list_legacy_checksums_after(pool, &after_id, 50).await {
+            Ok(batch) => batch,
+            Err(e) => {
+                tracing::warn!("checksum migration query: {e}");
+                return false;
+            }
+        };
+        if batch.is_empty() {
+            break;
+        }
+
+        for (id, ext) in batch {
+            after_id = id.clone();
+            let path = media_dir.join(format!("{id}.{ext}"));
+            let result = async {
+                let mut file = tokio::fs::File::open(&path).await?;
+                let mut buffer = vec![0u8; BUFFER_SIZE];
+                let mut hasher = Xxh3::new();
+                loop {
+                    let read = file.read(&mut buffer).await?;
+                    if read == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..read]);
+                }
+                Ok::<String, std::io::Error>(format!("{:032x}", hasher.digest128()))
+            }.await;
+
+            match result {
+                Ok(checksum) => match db::set_checksum(pool, &id, &checksum).await {
+                    Ok(()) => migrated += 1,
+                    Err(e) => {
+                        db_failed += 1;
+                        tracing::warn!("checksum migration set {id}: {e}");
+                    }
+                },
+                Err(e) => {
+                    read_failed += 1;
+                    tracing::warn!("checksum migration read {}: {e}", path.display());
+                }
+            }
+        }
+    }
+
+    if migrated > 0 || read_failed > 0 || db_failed > 0 {
+        tracing::info!(
+            "checksum migration: XXH3-128 migrated={migrated}, read_failed={read_failed}, db_failed={db_failed}"
+        );
+    }
+    read_failed == 0 && db_failed == 0
+}
+
 #[derive(serde::Deserialize)]
 struct ClientLogEntry {
     level: String,
@@ -226,4 +298,31 @@ async fn receive_client_logs(
         }
     }
     axum::Json(serde_json::json!({"received": body.logs.len()}))
+}
+
+#[cfg(test)]
+mod tests {
+    use xxhash_rust::xxh3::{xxh3_128, Xxh3};
+
+    #[test]
+    fn xxh3_128_matches_canonical_vectors() {
+        let vectors = [
+            (b"".as_slice(), "99aa06d3014798d86001c324468d497f"),
+            (b"abc".as_slice(), "06b05ab6733a618578af5f94892f3950"),
+            (b"Hello, World!".as_slice(), "531df2844447dd5077db03842cd75395"),
+            (
+                b"The quick brown fox jumps over the lazy dog".as_slice(),
+                "ddd650205ca3e7fa24a1cc2e3a8a7651",
+            ),
+        ];
+
+        for (input, expected) in vectors {
+            assert_eq!(format!("{:032x}", xxh3_128(input)), expected);
+            let mut streamed = Xxh3::new();
+            for chunk in input.chunks(3) {
+                streamed.update(chunk);
+            }
+            assert_eq!(format!("{:032x}", streamed.digest128()), expected);
+        }
+    }
 }

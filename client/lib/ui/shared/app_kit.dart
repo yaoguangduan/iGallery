@@ -13,10 +13,7 @@ class AppCard extends StatelessWidget {
   Widget build(BuildContext context) {
     return GestureDetector(
       onTap: onTap,
-      child: Padding(
-        padding: padding ?? AppSpace.card,
-        child: child,
-      ),
+      child: Padding(padding: padding ?? AppSpace.card, child: child),
     );
   }
 }
@@ -27,6 +24,48 @@ class AppDivider extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Divider(height: 0.5, thickness: 0.5, color: context.colors.outline);
+  }
+}
+
+/// 滚动时浮现的统一滚动条：中性灰、圆头、离屏幕边缘留白，可直接拖动。
+class AppScrollbar extends StatelessWidget {
+  final ScrollController controller;
+  final Widget child;
+
+  const AppScrollbar({
+    super.key,
+    required this.controller,
+    required this.child,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.colors;
+    return ScrollbarTheme(
+      data: ScrollbarTheme.of(context).copyWith(
+        thumbColor: WidgetStateProperty.resolveWith((states) {
+          final active =
+              states.contains(WidgetState.dragged) ||
+              states.contains(WidgetState.hovered);
+          return c.onSurfaceVariant.withValues(alpha: active ? 0.72 : 0.46);
+        }),
+        thickness: WidgetStateProperty.resolveWith((states) {
+          return states.contains(WidgetState.hovered) ? 8 : 7;
+        }),
+        radius: const Radius.circular(AppRadius.pill),
+        crossAxisMargin: AppSpace.xs,
+        mainAxisMargin: AppSpace.sm,
+        minThumbLength: 48,
+      ),
+      child: Scrollbar(
+        controller: controller,
+        interactive: true,
+        child: ScrollConfiguration(
+          behavior: ScrollConfiguration.of(context).copyWith(scrollbars: false),
+          child: child,
+        ),
+      ),
+    );
   }
 }
 
@@ -87,9 +126,13 @@ class AppButton extends StatelessWidget {
               Icon(icon, size: AppIconSize.sm),
               const SizedBox(width: 6),
             ],
-            Text(label,
-                style: const TextStyle(
-                    fontSize: AppType.sm, fontWeight: FontWeight.w600)),
+            Text(
+              label,
+              style: const TextStyle(
+                fontSize: AppType.sm,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
           ],
         ),
       ),
@@ -122,10 +165,7 @@ class AppEmptyState extends StatelessWidget {
             message,
             style: TextStyle(color: c.onSurfaceVariant, fontSize: AppType.sm),
           ),
-          if (action != null) ...[
-            const SizedBox(height: 16),
-            action!,
-          ],
+          if (action != null) ...[const SizedBox(height: 16), action!],
         ],
       ),
     );
@@ -161,25 +201,32 @@ Future<bool> appConfirmDialog(
   final result = await showDialog<bool>(
     context: context,
     builder: (ctx) => AlertDialog(
-      title: Text(title,
-          style: TextStyle(
-              color: c.onSurface,
-              fontSize: AppType.mdPlus,
-              fontWeight: FontWeight.w600)),
-      content: Text(message,
-          style: TextStyle(color: c.onSurfaceVariant, fontSize: AppType.md)),
+      title: Text(
+        title,
+        style: TextStyle(
+          color: c.onSurface,
+          fontSize: AppType.mdPlus,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+      content: Text(
+        message,
+        style: TextStyle(color: c.onSurfaceVariant, fontSize: AppType.md),
+      ),
       actions: [
         TextButton(
           onPressed: () => Navigator.pop(ctx, false),
-          child:
-              Text('取消', style: TextStyle(color: c.onSurfaceVariant)),
+          child: Text('取消', style: TextStyle(color: c.onSurfaceVariant)),
         ),
         TextButton(
           onPressed: () => Navigator.pop(ctx, true),
-          child: Text(confirmLabel,
-              style: TextStyle(
-                  color: destructive ? c.error : c.brand,
-                  fontWeight: FontWeight.w600)),
+          child: Text(
+            confirmLabel,
+            style: TextStyle(
+              color: destructive ? c.error : c.brand,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
         ),
       ],
     ),

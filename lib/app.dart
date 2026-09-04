@@ -13,12 +13,13 @@ class IGalleryApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // 亮色 only：状态栏透明 + 深色图标
-    SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
-      statusBarColor: Colors.transparent,
+    // 亮色 only：状态栏与背景同色（白），深色图标。
+    // 不用透明——非 edge-to-edge 的 Android 上透明会露出黑色窗口底。
+    SystemChrome.setSystemUIOverlayStyle(SystemUiOverlayStyle(
+      statusBarColor: AppColors.light.bg,
       statusBarIconBrightness: Brightness.dark,   // Android
       statusBarBrightness: Brightness.light,      // iOS
-      systemNavigationBarColor: Color(0xFFFFFFFF),
+      systemNavigationBarColor: AppColors.light.bg,
       systemNavigationBarIconBrightness: Brightness.dark,
     ));
 

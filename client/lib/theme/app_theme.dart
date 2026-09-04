@@ -71,8 +71,8 @@ abstract class AppRadius {
 abstract class AppIconSize {
   static const double sm = 16;
   static const double md = 18;
-  static const double lg = 20;
-  static const double xl = 22;
+  static const double lg = 22;
+  static const double xl = 24;
   static const double hero = 32;
 }
 

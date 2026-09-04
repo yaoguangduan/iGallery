@@ -102,16 +102,32 @@ class DiscoveryService with WidgetsBindingObserver {
   void _handleResolved(BonsoirService service) {
     final host = service.hostAddress;
     if (host == null || host.isEmpty) return;
-    final info = ServerInfo(
+    final state = _state;
+    if (state == null) return;
+    final discovered = ServerInfo(
       name: service.attributes['name'] ?? service.name,
       host: host,
       port: service.port,
       version: service.attributes['version'],
     );
-    _state?.addDiscovered(info);
-    if (_state?.status == ConnectionStatus.disconnected) {
+
+    // 按名称去重：mDNS 的 name 就是服务端 device_name，IP 变了也能认出同一台。
+    // 已保存的服务器不再当成"新发现"塞进发现列表，避免列表里出现重复条目。
+    final known = state.findKnown(discovered);
+    if (known == null) {
+      state.addDiscovered(discovered);
+    }
+
+    final st = state.status;
+    if (st == ConnectionStatus.disconnected || st == ConnectionStatus.unreachable) {
+      // 未连、或上次连的已经够不着了，就自动连这台发现的。
+      // connect() 内部按名称合并：已保存的同一台会更新地址、复用 token，
+      // 不会产生第二条记录。
       // ignore: unawaited_futures
-      _state?.connect(info);
+      state.connect(discovered);
+    } else if (known != null) {
+      // 此刻不连接（可能正连着别的），但把已保存条目的地址刷成刚发现的
+      state.noteSeen(discovered);
     }
   }
 }

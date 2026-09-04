@@ -6,7 +6,7 @@ publish_to: 'none'
 # plugin cannot parse as an integer, so it silently ships versionCode 1. A frozen
 # +1 has the same effect by hand. Both halves are maintained by tool/ship.sh
 # (code = major*10000 + minor*100 + patch).
-version: 0.1.9+109
+version: 0.1.24+124
 
 environment:
   sdk: ^3.10.0
@@ -30,10 +30,14 @@ dependencies:
   sqflite: ^2.4.1
   sqflite_common_ffi: ^2.3.4
   path: ^1.9.0
-  crypto: ^3.0.6
+  hashlib: ^2.4.2
   connectivity_plus: ^6.1.0
   uuid: ^4.5.1
   photo_manager: ^3.6.0
+  wakelock_plus: ^1.2.8
+  flutter_foreground_task: ^8.12.0
+  receive_sharing_intent: ^1.8.1
+  image_picker: ^1.1.2
 
 dev_dependencies:
   flutter_test:

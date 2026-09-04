@@ -1,5 +1,4 @@
 import 'package:flutter/foundation.dart';
-import 'package:sqflite/sqflite.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:path/path.dart' as p;
 
@@ -23,7 +22,7 @@ class KvStore {
     final dbPath = p.join(await getDatabasesPath(), 'igallery_prefs.db');
     _db = await openDatabase(
       dbPath,
-      version: 2,
+      version: 5,
       onCreate: (db, _) async {
         await _createSchema(db);
       },
@@ -31,13 +30,27 @@ class KvStore {
         if (oldV < 2) {
           await _createUploadHistory(db);
         }
+        if (oldV < 3) {
+          await _createUploadedHashes(db);
+        }
+        if (oldV < 4) {
+          await _createAssetHashes(db);
+        }
+        if (oldV < 5) {
+          await db.execute('DROP TABLE IF EXISTS uploaded_hashes');
+          await _createUploadedHashes(db);
+        }
       },
     );
   }
 
   static Future<void> _createSchema(Database db) async {
-    await db.execute('CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)');
+    await db.execute(
+      'CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)',
+    );
     await _createUploadHistory(db);
+    await _createUploadedHashes(db);
+    await _createAssetHashes(db);
   }
 
   static Future<void> _createUploadHistory(Database db) async {
@@ -55,7 +68,29 @@ class KvStore {
         finished_at INTEGER
       )
     ''');
-    await db.execute('CREATE INDEX IF NOT EXISTS idx_upload_started ON upload_history(started_at DESC)');
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_upload_started ON upload_history(started_at DESC)',
+    );
+  }
+
+  static Future<void> _createUploadedHashes(Database db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS uploaded_hashes (
+        server_key TEXT NOT NULL,
+        checksum TEXT NOT NULL,
+        PRIMARY KEY(server_key, checksum)
+      )
+    ''');
+  }
+
+  static Future<void> _createAssetHashes(Database db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS asset_hashes (
+        asset_id TEXT PRIMARY KEY,
+        fingerprint TEXT NOT NULL,
+        checksum TEXT NOT NULL
+      )
+    ''');
   }
 
   Future<String?> get(String key) async {
@@ -66,8 +101,10 @@ class KvStore {
   }
 
   Future<void> set(String key, String value) async {
-    await _db?.insert('kv', {'key': key, 'value': value},
-        conflictAlgorithm: ConflictAlgorithm.replace);
+    await _db?.insert('kv', {
+      'key': key,
+      'value': value,
+    }, conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
   Future<Map<String, String>> getAll() async {
