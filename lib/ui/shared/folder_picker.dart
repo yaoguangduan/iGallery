@@ -79,7 +79,6 @@ class _UploadFolderPickerState extends State<_UploadFolderPicker> {
   final List<({String id, String name})> _path = [];
   bool _loading = true;
   bool _loadError = false;
-  int _loadSeq = 0; // #31 快速导航时丢弃过期响应，别让旧目录的列表盖掉新目录
 
   @override
   void initState() {
@@ -88,25 +87,17 @@ class _UploadFolderPickerState extends State<_UploadFolderPicker> {
   }
 
   Future<void> _load() async {
-    final seq = ++_loadSeq;
     setState(() {
       _loading = true;
       _loadError = false;
     });
-    List<FolderItem> folders;
-    var error = false;
     try {
-      folders = await widget.service.listFolders(parentId: _browseFolderId);
+      _folders = await widget.service.listFolders(parentId: _browseFolderId);
     } catch (_) {
-      error = true;
-      folders = [];
+      _loadError = true;
+      _folders = [];
     }
-    if (!mounted || seq != _loadSeq) return; // 已有更新的导航，丢弃这次过期结果
-    setState(() {
-      _folders = folders;
-      _loadError = error;
-      _loading = false;
-    });
+    if (mounted) setState(() => _loading = false);
   }
 
   void _enter(FolderItem folder) {

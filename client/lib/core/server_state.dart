@@ -1,9 +1,11 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 
 import 'api.dart';
 import 'auth_store.dart';
+import 'hash_sync.dart';
 import 'kv_store.dart';
 
 class ServerInfo {
@@ -232,6 +234,10 @@ class ServerState extends ChangeNotifier {
     _stats = null;
     apiConfig.baseUrl = server.baseUrl;
     apiConfig.token = null;
+    // serverKey(baseUrl) 定了就先从磁盘加载这台服务器的 hash 缓存，让"已传"徽章
+    // 立刻亮起来，不必等在线 syncFromServer（服务器一时连不上时也能显示）。
+    // 旧代码在 main.dart 里 baseUrl 还没设时就调 loadLocal，永远空转。
+    unawaited(HashSync.instance.loadLocal());
     notifyListeners();
 
     // token：先按地址，再按设备名（服务器换了 IP 也能认出来）

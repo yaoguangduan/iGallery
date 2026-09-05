@@ -3,7 +3,6 @@ import 'dart:convert';
 import 'dart:developer' as dev;
 
 import 'package:flutter/foundation.dart';
-import 'package:http/http.dart' as http;
 import 'package:sqflite/sqflite.dart';
 
 import 'api.dart';
@@ -88,7 +87,9 @@ class LogService {
         'created_at': r['created_at'],
       }).toList();
 
-      final resp = await http.Client()
+      // 复用 Api 的单例 client：旧写法每次 flush 都 new 一个 http.Client 且从不 close，
+      // 每 5 分钟泄漏一个带 keep-alive socket 的 client，也违反"HTTP 一律走 Api"。
+      final resp = await Api.instance.client
           .post(
             Uri.parse('${apiConfig.baseUrl}/v1/logs'),
             headers: {

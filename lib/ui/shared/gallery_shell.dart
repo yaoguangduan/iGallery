@@ -2,15 +2,21 @@ import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:provider/provider.dart';
 
 import '../../core/media_service.dart';
 import '../../core/platform.dart';
 import '../../core/server_state.dart';
+import '../../core/time_fmt.dart';
 import '../../core/upload_manager.dart';
 import '../../theme/app_theme.dart';
+import 'app_kit.dart';
 import 'app_toast.dart';
+import 'folder_picker.dart';
 import 'gallery_view.dart';
+import 'local_photos_tab.dart';
 import 'media_picker.dart';
 import 'media_viewer.dart';
 import 'profile_tab.dart';
@@ -27,7 +33,8 @@ class GalleryShell extends StatefulWidget {
   State<GalleryShell> createState() => _GalleryShellState();
 }
 
-class _GalleryShellState extends State<GalleryShell> implements GalleryShellHost {
+class _GalleryShellState extends State<GalleryShell>
+    implements GalleryShellHost {
   int _tab = 0;
   bool _resolving = false;
 
@@ -36,12 +43,19 @@ class _GalleryShellState extends State<GalleryShell> implements GalleryShellHost
   Set<String> _selectedIds = {};
   bool _allSelected = false;
   bool _allFavorite = false;
+  SelectionActionMode _selectionMode = SelectionActionMode.media;
+
+  // 文件夹层级（GalleryView 通过 updateFolderDepth 上报）
+  int _folderDepth = 0;
+  VoidCallback? _onGoBackFolder;
+
   // 当前活跃 tab 的操作回调（由 tab 注册）
   VoidCallback? _onToggleSelectAll;
   VoidCallback? _onFavorite;
   VoidCallback? _onMove;
   VoidCallback? _onDownload;
   VoidCallback? _onDelete;
+  VoidCallback? _onUpload;
   VoidCallback? _onExitSelection;
 
   // MediaViewer 提升到 shell 层
@@ -49,6 +63,31 @@ class _GalleryShellState extends State<GalleryShell> implements GalleryShellHost
   int? _viewerIndex;
   MediaService? _viewerService;
   void Function(String)? _onViewerDeleted;
+
+  bool _wasUploading = false;
+
+  @override
+  void initState() {
+    super.initState();
+    UploadManager.instance.addListener(_onUploadChanged);
+  }
+
+  @override
+  void dispose() {
+    UploadManager.instance.removeListener(_onUploadChanged);
+    super.dispose();
+  }
+
+  void _onUploadChanged() {
+    final uploading = UploadManager.instance.uploading;
+    if (!_wasUploading && uploading) {
+      setState(() => _resolving = true);
+    }
+    if (_wasUploading && !uploading && _resolving) {
+      setState(() => _resolving = false);
+    }
+    _wasUploading = uploading;
+  }
 
   @override
   void openViewer({
@@ -76,36 +115,47 @@ class _GalleryShellState extends State<GalleryShell> implements GalleryShellHost
 
   @override
   void updateSelection({
+    required int sourceTab,
     required bool selecting,
     required Set<String> selectedIds,
     required bool allSelected,
     required bool allFavorite,
+    SelectionActionMode mode = SelectionActionMode.media,
     VoidCallback? onToggleSelectAll,
     VoidCallback? onFavorite,
     VoidCallback? onMove,
     VoidCallback? onDownload,
     VoidCallback? onDelete,
+    VoidCallback? onUpload,
     VoidCallback? onExitSelection,
   }) {
-    if (_selecting == selecting &&
-        _selectedIds.length == selectedIds.length &&
-        _allSelected == allSelected &&
-        _allFavorite == allFavorite) return;
+    if (sourceTab != _tab) return;
     setState(() {
       _selecting = selecting;
       _selectedIds = selectedIds;
       _allSelected = allSelected;
       _allFavorite = allFavorite;
+      _selectionMode = mode;
       _onToggleSelectAll = onToggleSelectAll;
       _onFavorite = onFavorite;
       _onMove = onMove;
       _onDownload = onDownload;
       _onDelete = onDelete;
+      _onUpload = onUpload;
       _onExitSelection = onExitSelection;
     });
   }
 
   // ── 上传 ──
+
+  @override
+  void updateFolderDepth(int depth, {VoidCallback? onGoBack}) {
+    if (_folderDepth == depth) return;
+    setState(() {
+      _folderDepth = depth;
+      _onGoBackFolder = onGoBack;
+    });
+  }
 
   @override
   void switchToTab(int index) {
@@ -123,11 +173,15 @@ class _GalleryShellState extends State<GalleryShell> implements GalleryShellHost
     final service = MediaService(state);
 
     final List<PendingUpload> files;
-    if (isDesktop) {
+    final source = isDesktop
+        ? UploadSource.files
+        : await showUploadSourcePicker(context);
+    if (!mounted || source == null) return;
+    if (source == UploadSource.files) {
       final picked = await FilePicker.pickFiles(type: FileType.any);
-      files = picked
-          .where((f) => f.path != null)
-          .map((f) => PendingUpload(File(f.path!)))
+      files = (picked?.files ?? [])
+          .where((file) => file.path != null)
+          .map((file) => PendingUpload(File(file.path!)))
           .toList();
     } else {
       final result = await Navigator.of(context).push<List<PendingUpload>>(
@@ -137,28 +191,31 @@ class _GalleryShellState extends State<GalleryShell> implements GalleryShellHost
     }
     if (files.isEmpty || !mounted) return;
 
-    setState(() => _resolving = true);
-
     final serverUrl = state.baseUrl;
     final result = await UploadManager.instance.enqueue(
-      service, files,
+      service,
+      files,
       folderId: folderId,
       serverUrl: serverUrl,
     );
-    if (mounted && _resolving) setState(() => _resolving = false);
 
     if (mounted) {
       final parts = <String>['已上传 ${result.uploaded} 个'];
       if (result.dedup > 0) parts.add('${result.dedup} 个已存在跳过');
       if (result.failed > 0) parts.add('${result.failed} 个失败');
       if (result.cancelled > 0) parts.add('${result.cancelled} 个已取消');
-      showToast(context, parts.join(' · '),
-          kind: result.allOk ? ToastKind.success : ToastKind.error);
+      showToast(
+        context,
+        parts.join(' · '),
+        kind: result.allOk ? ToastKind.success : ToastKind.error,
+      );
     }
   }
 
   void _openUploadHistory() {
-    Navigator.of(context).push(MaterialPageRoute(builder: (_) => const UploadHistoryPage()));
+    Navigator.of(
+      context,
+    ).push(MaterialPageRoute(builder: (_) => const UploadHistoryPage()));
   }
 
   @override
@@ -166,22 +223,33 @@ class _GalleryShellState extends State<GalleryShell> implements GalleryShellHost
     final c = context.colors;
 
     return PopScope(
-        canPop: _viewerIndex == null && !_selecting && _tab == 0,
-        onPopInvokedWithResult: (didPop, _) {
-          if (didPop) return;
-          if (_viewerIndex != null) { _closeViewer(); return; }
-          if (_selecting) { _onExitSelection?.call(); return; }
-          if (_tab != 0) { setState(() => _tab = 0); return; }
-        },
-        child: Scaffold(
-          backgroundColor: c.bg,
-          bottomNavigationBar: _buildBottomBar(c),
-          body: SafeArea(
-            bottom: false,
-            child: Stack(
-              fit: StackFit.expand,
-              children: [
-                Column(children: [
+      canPop: _viewerIndex == null && !_selecting && _tab == 0 && _folderDepth == 0,
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) return;
+        if (_viewerIndex != null) return;
+        if (_selecting) {
+          _onExitSelection?.call();
+          return;
+        }
+        if (_tab == 0 && _folderDepth > 0) {
+          _onGoBackFolder?.call();
+          return;
+        }
+        if (_tab != 0) {
+          setState(() => _tab = 0);
+          return;
+        }
+      },
+      child: Scaffold(
+        backgroundColor: c.bg,
+        bottomNavigationBar: _buildBottomBar(c),
+        body: SafeArea(
+          bottom: false,
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              Column(
+                children: [
                   UploadBar(onTap: _openUploadHistory),
                   Expanded(
                     child: IndexedStack(
@@ -193,33 +261,40 @@ class _GalleryShellState extends State<GalleryShell> implements GalleryShellHost
                           shell: this,
                         ),
                         SearchTab(shell: this),
+                        LocalPhotosTab(shell: this, active: _tab == 2),
                         const ProfileTab(),
                       ],
                     ),
                   ),
-                ]),
-                if (_viewerIndex != null && _viewerItems != null && _viewerService != null)
-                  MediaViewer(
-                    items: _viewerItems!,
-                    initialIndex: _viewerIndex!,
-                    service: _viewerService!,
-                    onClose: _closeViewer,
-                    onDeleted: (id) {
-                      _onViewerDeleted?.call(id);
-                      setState(() {
-                        _viewerItems!.removeWhere((m) => m.id == id);
-                        if (_viewerItems!.isEmpty) _closeViewer();
-                      });
-                    },
-                  ),
-                if (_resolving)
-                  _UploadOverlay(
-                    onHide: () => setState(() => _resolving = false),
-                  ),
-              ],
-            ),
+                ],
+              ),
+              if (_viewerIndex != null &&
+                  _viewerItems != null &&
+                  _viewerService != null)
+                MediaViewer(
+                  items: _viewerItems!,
+                  initialIndex: _viewerIndex!,
+                  service: _viewerService!,
+                  onClose: _closeViewer,
+                  onDeleted: (id) {
+                    _onViewerDeleted?.call(id);
+                    setState(() {
+                      _viewerItems!.removeWhere((m) => m.id == id);
+                      if (_viewerItems!.isEmpty) _closeViewer();
+                    });
+                  },
+                ),
+              if (_resolving)
+                _UploadOverlay(
+                  onHide: () {
+                    UploadManager.instance.showBar();
+                    setState(() => _resolving = false);
+                  },
+                ),
+            ],
           ),
         ),
+      ),
     );
   }
 
@@ -240,17 +315,122 @@ class _GalleryShellState extends State<GalleryShell> implements GalleryShellHost
         top: false,
         child: SizedBox(
           height: 60,
-          child: Row(children: [
-            _tabItem(c, 0, Icons.photo_library_outlined, Icons.photo_library, '相册'),
-            _tabItem(c, 1, Icons.search_outlined, Icons.search, '搜索'),
-            _tabItem(c, 2, Icons.person_outline, Icons.person, '我的'),
-          ]),
+          child: Row(
+            children: [
+              _tabItem(
+                c,
+                0,
+                Icons.photo_library_outlined,
+                Icons.photo_library,
+                '相册',
+              ),
+              _tabItem(c, 1, Icons.search_outlined, Icons.search, '搜索'),
+              _cameraButton(c),
+              _tabItem(c, 2, Icons.photo_outlined, Icons.photo, '本地'),
+              _tabItem(c, 3, Icons.person_outline, Icons.person, '我的'),
+            ],
+          ),
         ),
       ),
     );
   }
 
-  Widget _tabItem(AppColors c, int index, IconData icon, IconData activeIcon, String label) {
+  Widget _cameraButton(AppColors c) {
+    return Expanded(
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: _showCaptureSheet,
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Container(
+              width: 40,
+              height: 40,
+              decoration: BoxDecoration(color: c.brand, shape: BoxShape.circle),
+              child: const Icon(
+                Icons.camera_alt,
+                size: 20,
+                color: Colors.white,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showCaptureSheet() async {
+    final c = context.colors;
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: c.bg,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(
+          top: Radius.circular(AppRadius.sheet),
+        ),
+      ),
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const SheetHandle(),
+            ListTile(
+              leading: Icon(Icons.photo_camera, color: c.onSurface),
+              title: Text('拍照', style: TextStyle(
+                color: c.onSurface, fontSize: AppType.sm,
+              )),
+              onTap: () => Navigator.pop(ctx, 'photo'),
+            ),
+            ListTile(
+              leading: Icon(Icons.videocam, color: c.onSurface),
+              title: Text('录像', style: TextStyle(
+                color: c.onSurface, fontSize: AppType.sm,
+              )),
+              onTap: () => Navigator.pop(ctx, 'video'),
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+    if (choice == null || !mounted) return;
+    _capture(video: choice == 'video');
+  }
+
+  Future<void> _capture({required bool video}) async {
+    try {
+      final picker = ImagePicker();
+      final XFile? xfile;
+      if (video) {
+        xfile = await picker.pickVideo(
+          source: ImageSource.camera,
+          maxDuration: const Duration(minutes: 30),
+        );
+      } else {
+        xfile = await picker.pickImage(source: ImageSource.camera);
+      }
+      if (xfile == null || !mounted) return;
+      final file = File(xfile.path);
+      String? takenAtIso;
+      try {
+        takenAtIso = toServerRfc3339((await file.stat()).modified);
+      } catch (_) {}
+      if (!mounted) return;
+      await showFolderPickerAndUpload(context, [
+        PendingUpload(file, takenAtIso: takenAtIso),
+      ]);
+    } catch (e) {
+      if (mounted) showToast(context, '无法打开相机: $e', kind: ToastKind.error);
+    }
+  }
+
+  Widget _tabItem(
+    AppColors c,
+    int index,
+    IconData icon,
+    IconData activeIcon,
+    String label,
+  ) {
     final active = _tab == index;
     return Expanded(
       child: GestureDetector(
@@ -259,14 +439,20 @@ class _GalleryShellState extends State<GalleryShell> implements GalleryShellHost
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Icon(active ? activeIcon : icon, size: 24,
-                color: active ? c.brand : c.onMuted),
-            const SizedBox(height: 3),
-            Text(label, style: TextStyle(
-              fontSize: 11.5,
+            Icon(
+              active ? activeIcon : icon,
+              size: 24,
               color: active ? c.brand : c.onMuted,
-              fontWeight: active ? FontWeight.w600 : FontWeight.w400,
-            )),
+            ),
+            const SizedBox(height: 3),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 11.5,
+                color: active ? c.brand : c.onMuted,
+                fontWeight: active ? FontWeight.w600 : FontWeight.w400,
+              ),
+            ),
           ],
         ),
       ),
@@ -274,6 +460,7 @@ class _GalleryShellState extends State<GalleryShell> implements GalleryShellHost
   }
 
   Widget _buildSelectionBar(AppColors c) {
+    final localUpload = _selectionMode == SelectionActionMode.localUpload;
     return Container(
       decoration: BoxDecoration(
         color: c.surface,
@@ -285,50 +472,77 @@ class _GalleryShellState extends State<GalleryShell> implements GalleryShellHost
           height: 60,
           child: Row(
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-            children: [
-              _selectionAction(
-                c,
-                icon: _allSelected ? Icons.deselect : Icons.select_all,
-                label: _allSelected ? '取消全选' : '全选',
-                color: _allSelected ? c.brand : c.onSurfaceVariant,
-                onTap: _onToggleSelectAll,
-              ),
-              _selectionAction(
-                c,
-                icon: _allFavorite ? Icons.favorite : Icons.favorite_border,
-                label: _allFavorite ? '取消收藏' : '收藏',
-                color: _allFavorite ? c.brand : c.onSurfaceVariant,
-                onTap: _onFavorite,
-              ),
-              _selectionAction(
-                c,
-                icon: Icons.drive_file_move_outlined,
-                label: '移动',
-                color: c.onSurfaceVariant,
-                onTap: _onMove,
-              ),
-              _selectionAction(
-                c,
-                icon: Icons.file_download_outlined,
-                label: '下载',
-                color: c.onSurfaceVariant,
-                onTap: _onDownload,
-              ),
-              _selectionAction(
-                c,
-                icon: Icons.delete_outline,
-                label: '删除',
-                color: c.error,
-                onTap: _onDelete,
-              ),
-            ],
+            children: localUpload
+                ? [
+                    _selectionAction(
+                      c,
+                      icon: _allSelected ? Icons.deselect : Icons.select_all,
+                      label: _allSelected ? '取消全选' : '全选已加载',
+                      color: _allSelected ? c.brand : c.onSurfaceVariant,
+                      onTap: _onToggleSelectAll,
+                    ),
+                    _selectionAction(
+                      c,
+                      icon: Icons.upload_rounded,
+                      label: '上传',
+                      color: c.brand,
+                      onTap: _onUpload,
+                    ),
+                    _selectionAction(
+                      c,
+                      icon: Icons.delete_outline,
+                      label: '删除本地',
+                      color: c.error,
+                      onTap: _onDelete,
+                    ),
+                  ]
+                : [
+                    _selectionAction(
+                      c,
+                      icon: _allSelected ? Icons.deselect : Icons.select_all,
+                      label: _allSelected ? '取消全选' : '全选',
+                      color: _allSelected ? c.brand : c.onSurfaceVariant,
+                      onTap: _onToggleSelectAll,
+                    ),
+                    _selectionAction(
+                      c,
+                      icon: _allFavorite
+                          ? Icons.favorite
+                          : Icons.favorite_border,
+                      label: _allFavorite ? '取消收藏' : '收藏',
+                      color: _allFavorite ? c.brand : c.onSurfaceVariant,
+                      onTap: _onFavorite,
+                    ),
+                    _selectionAction(
+                      c,
+                      icon: Icons.drive_file_move_outlined,
+                      label: '移动',
+                      color: c.onSurfaceVariant,
+                      onTap: _onMove,
+                    ),
+                    _selectionAction(
+                      c,
+                      icon: Icons.file_download_outlined,
+                      label: '下载',
+                      color: c.onSurfaceVariant,
+                      onTap: _onDownload,
+                    ),
+                    _selectionAction(
+                      c,
+                      icon: Icons.delete_outline,
+                      label: '删除',
+                      color: c.error,
+                      onTap: _onDelete,
+                    ),
+                  ],
           ),
         ),
       ),
     );
   }
 
-  Widget _selectionAction(AppColors c, {
+  Widget _selectionAction(
+    AppColors c, {
     required IconData icon,
     required String label,
     required Color color,
@@ -351,7 +565,7 @@ class _GalleryShellState extends State<GalleryShell> implements GalleryShellHost
   }
 }
 
-// ── 上传进度浮层（底部卡片风格，类似 Google Drive） ──
+// ── 上传进度浮层（居中，彩色旋转环 + 高对比度按钮） ──
 
 class _UploadOverlay extends StatefulWidget {
   final VoidCallback onHide;
@@ -361,25 +575,47 @@ class _UploadOverlay extends StatefulWidget {
   State<_UploadOverlay> createState() => _UploadOverlayState();
 }
 
-class _UploadOverlayState extends State<_UploadOverlay> {
+class _UploadOverlayState extends State<_UploadOverlay>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _spinCtrl;
+
+  static const _ringColors = [
+    Color(0xFFFF3B30), // red
+    Color(0xFFFF9500), // orange
+    Color(0xFFFFCC00), // yellow
+    Color(0xFF34C759), // green
+    Color(0xFF007AFF), // blue
+    Color(0xFFAF52DE), // purple
+    Color(0xFFFF3B30), // wrap back to red
+  ];
+
   @override
   void initState() {
     super.initState();
+    _spinCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1800),
+    )..repeat();
     UploadManager.instance.addListener(_onChange);
   }
 
   @override
   void dispose() {
+    _spinCtrl.dispose();
     UploadManager.instance.removeListener(_onChange);
     super.dispose();
   }
 
-  void _onChange() { if (mounted) setState(() {}); }
+  void _onChange() {
+    if (mounted) setState(() {});
+  }
 
   String _fmtBytes(double bytes) {
     if (bytes < 1024) return '${bytes.toStringAsFixed(0)} B';
     if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
-    if (bytes < 1024 * 1024 * 1024) return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    if (bytes < 1024 * 1024 * 1024) {
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
     return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
   }
 
@@ -394,154 +630,229 @@ class _UploadOverlayState extends State<_UploadOverlay> {
     final c = context.colors;
     final m = UploadManager.instance;
     final uploading = m.uploading;
+    final retrying = m.retrying;
     final progress = m.progress;
     final speed = m.speedBps;
     final eta = m.eta;
     final pct = (progress * 100).toInt();
-    final bottomPad = MediaQuery.of(context).padding.bottom;
 
-    return Positioned.fill(child: GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: () {},
-      child: ColoredBox(
-        color: Colors.black26,
-        child: Column(children: [
-          const Spacer(),
-          Container(
-            margin: EdgeInsets.fromLTRB(12, 0, 12, 12 + bottomPad),
-            padding: const EdgeInsets.fromLTRB(16, 14, 12, 14),
-            decoration: BoxDecoration(
-              color: c.bg,
-              borderRadius: BorderRadius.circular(AppRadius.card),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withValues(alpha: 0.10),
-                  blurRadius: 16,
-                  offset: const Offset(0, 4),
-                ),
-              ],
-            ),
-            child: Column(mainAxisSize: MainAxisSize.min, children: [
-              Row(children: [
-                // 小圆环进度
-                SizedBox(
-                  width: 36, height: 36,
-                  child: Stack(alignment: Alignment.center, children: [
-                    SizedBox(
-                      width: 36, height: 36,
-                      child: CircularProgressIndicator(
-                        value: uploading ? progress.clamp(0, 1).toDouble() : null,
-                        strokeWidth: 3,
-                        color: c.brand,
-                        backgroundColor: c.outline,
-                      ),
+    return Positioned.fill(
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () {},
+        child: ColoredBox(
+          color: Colors.black54,
+          child: Center(
+            child: Container(
+              width: 280,
+              padding: const EdgeInsets.fromLTRB(24, 28, 24, 22),
+              decoration: BoxDecoration(
+                color: c.bg,
+                borderRadius: BorderRadius.circular(20),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.18),
+                    blurRadius: 32,
+                    offset: const Offset(0, 12),
+                  ),
+                ],
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // 彩色旋转外环 + 百分比 / 断网图标
+                  SizedBox(
+                    width: 80,
+                    height: 80,
+                    child: retrying
+                        ? Center(
+                            child: Icon(
+                              Icons.wifi_off_rounded,
+                              size: 36,
+                              color: c.onMuted,
+                            ),
+                          )
+                        : AnimatedBuilder(
+                            animation: _spinCtrl,
+                            builder: (ctx, _) => CustomPaint(
+                              painter: _RainbowRingPainter(
+                                rotation: _spinCtrl.value * 2 * 3.14159265,
+                                colors: _ringColors,
+                                strokeWidth: 5,
+                              ),
+                              child: Center(
+                                child: uploading
+                                    ? Text(
+                                        '$pct%',
+                                        style: TextStyle(
+                                          color: c.onSurface,
+                                          fontSize: 18,
+                                          fontWeight: FontWeight.w800,
+                                        ),
+                                      )
+                                    : Icon(
+                                        Icons.cloud_upload_rounded,
+                                        size: 28,
+                                        color: c.brand,
+                                      ),
+                              ),
+                            ),
+                          ),
+                  ),
+                  const SizedBox(height: 18),
+                  // 上传状态文字
+                  Text(
+                    retrying
+                        ? '网络断开，重试中…'
+                        : uploading
+                            ? '正在上传 ${m.completed}/${m.total}'
+                            : '正在准备上传…',
+                    style: TextStyle(
+                      color: c.onSurface,
+                      fontSize: AppType.md,
+                      fontWeight: FontWeight.w700,
                     ),
-                    if (uploading)
-                      Text('$pct', style: TextStyle(
-                        color: c.onSurface, fontSize: 10,
-                        fontWeight: FontWeight.w700,
-                      ))
-                    else
-                      Icon(Icons.cloud_upload_outlined, size: 16, color: c.brand),
-                  ]),
-                ),
-                const SizedBox(width: 12),
-                // 文本信息
-                Expanded(child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(
-                      uploading
-                          ? '正在上传 ${m.completed}/${m.total}'
-                          : '正在准备上传…',
-                      style: TextStyle(
-                        color: c.onSurface,
-                        fontSize: AppType.xs,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                    if (uploading && (speed > 0 || eta != null))
-                      Padding(
-                        padding: const EdgeInsets.only(top: 2),
-                        child: Text(
-                          [
-                            if (speed > 0) '${_fmtBytes(speed)}/s',
-                            if (eta != null) '剩余 ${_fmtEta(eta)}',
-                          ].join(' · '),
-                          style: TextStyle(color: c.onMuted, fontSize: AppType.xxs),
+                  ),
+                  if (retrying)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 6),
+                      child: Text(
+                        '已完成 ${m.completed}/${m.total}，等待网络恢复',
+                        style: TextStyle(
+                          color: c.onMuted,
+                          fontSize: AppType.xs,
                         ),
                       ),
-                  ],
-                )),
-                // 操作按钮
-                if (uploading && !m.cancelling)
-                  _PillButton(
-                    label: '取消',
-                    color: c.onSurfaceVariant,
-                    outlined: true,
-                    onTap: m.cancel,
-                  ),
-                if (uploading && m.cancelling)
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 8),
-                    child: SizedBox(
-                      width: 18, height: 18,
-                      child: CircularProgressIndicator(strokeWidth: 2, color: c.onMuted),
                     ),
+                  // 速度 + ETA
+                  if (uploading && !retrying)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 6),
+                      child: Text(
+                        [
+                          if (speed > 0) '${_fmtBytes(speed)}/s',
+                          if (speed <= 0) '计算中…',
+                          if (eta != null) '剩余 ${_fmtEta(eta)}',
+                        ].join(' · '),
+                        style: TextStyle(
+                          color: c.onMuted,
+                          fontSize: AppType.xs,
+                        ),
+                      ),
+                    ),
+                  const SizedBox(height: 24),
+                  // 按钮
+                  Row(
+                    children: [
+                      if (uploading && !m.cancelling)
+                        Expanded(
+                          child: _ActionButton(
+                            label: '取消上传',
+                            color: c.onSurface,
+                            bg: c.surface2,
+                            onTap: m.cancel,
+                          ),
+                        ),
+                      if (uploading && m.cancelling)
+                        Expanded(
+                          child: Center(
+                            child: SizedBox(
+                              width: 20,
+                              height: 20,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: c.onMuted,
+                              ),
+                            ),
+                          ),
+                        ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: _ActionButton(
+                          label: '后台运行',
+                          color: Colors.white,
+                          bg: c.brand,
+                          onTap: widget.onHide,
+                        ),
+                      ),
+                    ],
                   ),
-                const SizedBox(width: 4),
-                _PillButton(
-                  label: '后台',
-                  color: c.brand,
-                  onTap: widget.onHide,
-                ),
-              ]),
-              // 底部线性进度条
-              if (uploading) Padding(
-                padding: const EdgeInsets.only(top: 10),
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(2),
-                  child: LinearProgressIndicator(
-                    value: progress.clamp(0, 1).toDouble(),
-                    minHeight: 3,
-                    backgroundColor: c.surface2,
-                    valueColor: AlwaysStoppedAnimation(c.brand),
-                  ),
-                ),
+                ],
               ),
-            ]),
+            ),
           ),
-        ]),
+        ),
       ),
-    ));
+    );
   }
 }
 
-class _PillButton extends StatelessWidget {
+// ── 抖音风格相机面板 ──
+
+class _ActionButton extends StatelessWidget {
   final String label;
   final Color color;
-  final bool outlined;
+  final Color bg;
   final VoidCallback? onTap;
-  const _PillButton({required this.label, required this.color, this.outlined = false, this.onTap});
+  const _ActionButton({
+    required this.label,
+    required this.color,
+    required this.bg,
+    this.onTap,
+  });
 
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
       onTap: onTap,
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        height: 44,
+        alignment: Alignment.center,
         decoration: BoxDecoration(
-          color: outlined ? Colors.transparent : color,
-          borderRadius: BorderRadius.circular(AppRadius.pill),
-          border: outlined ? Border.all(color: color.withValues(alpha: 0.3)) : null,
+          color: bg,
+          borderRadius: BorderRadius.circular(AppRadius.chip),
         ),
-        child: Text(label, style: TextStyle(
-          color: outlined ? color : Colors.white,
-          fontSize: AppType.xxs,
-          fontWeight: FontWeight.w600,
-        )),
+        child: Text(
+          label,
+          style: TextStyle(
+            color: color,
+            fontSize: AppType.sm,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
       ),
     );
   }
+}
+
+class _RainbowRingPainter extends CustomPainter {
+  final double rotation;
+  final List<Color> colors;
+  final double strokeWidth;
+  _RainbowRingPainter({
+    required this.rotation,
+    required this.colors,
+    required this.strokeWidth,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = size.center(Offset.zero);
+    canvas.save();
+    canvas.translate(center.dx, center.dy);
+    canvas.rotate(rotation);
+    canvas.translate(-center.dx, -center.dy);
+    final rect = Offset.zero & size;
+    final paint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = strokeWidth
+      ..strokeCap = StrokeCap.round
+      ..shader = SweepGradient(colors: colors).createShader(rect);
+    final r = (size.width - strokeWidth) / 2;
+    canvas.drawCircle(center, r, paint);
+    canvas.restore();
+  }
+
+  @override
+  bool shouldRepaint(_RainbowRingPainter old) => old.rotation != rotation;
 }

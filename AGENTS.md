@@ -405,7 +405,7 @@ POST   /v1/folders              创建
 GET    /v1/folders/{id}         详情
 GET    /v1/folders/{id}/ancestors  祖先路径（面包屑用）
 PATCH  /v1/folders/{id}         重命名
-DELETE /v1/folders/{id}         删除（必须为空）
+DELETE /v1/folders/{id}         删除（递归：子树内媒体逻辑删除，子文件夹一并移除）
 GET    /v1/info                 服务器信息
 GET    /v1/auth                 {required, authorized}（探测是否需 token）
 ```

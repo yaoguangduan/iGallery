@@ -76,13 +76,14 @@ pub async fn get_thumb(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    // 先查库：已软删除的不再给缩略图，否则删掉的图还会出现在别的客户端网格里
     match db::get_media(&state.pool, &id).await {
         Ok(Some(row)) if row.deleted_at.is_none() => {}
         Ok(_) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => { tracing::error!("get_thumb db: {e}"); return StatusCode::INTERNAL_SERVER_ERROR.into_response(); }
     }
-    let path = state.thumbs_dir.join(format!("{id}.jpg"));
+    // blur 查询参数已移除：加密文件夹的马赛克封面由客户端渲染普通缩略图实现
+    let filename = format!("{id}.jpg");
+    let path = state.thumbs_dir.join(&filename);
     match fs::read(&path).await {
         Ok(data) => (
             [
@@ -146,34 +147,51 @@ pub async fn upload(
     let mut uploaded: Vec<UploadItem> = Vec::new();
     let mut errors: Vec<UploadError> = Vec::new();
 
-    while let Ok(Some(field)) = multipart.next_field().await {
-        let name = field.name().unwrap_or("").to_string();
+    loop {
+        match multipart.next_field().await {
+            Ok(Some(field)) => {
+                let name = field.name().unwrap_or("").to_string();
 
-        if name == "taken_at" {
-            if let Ok(text) = field.text().await { taken_at_explicit = Some(text); }
-            continue;
-        }
-        if name == "file_mtime" {
-            if let Ok(text) = field.text().await { mtime_fallback = Some(text); }
-            continue;
-        }
-        if name == "folder_id" {
-            if let Ok(text) = field.text().await { folder_id_override = Some(text); }
-            continue;
-        }
-        if name != "file" { continue; }
+                if name == "taken_at" {
+                    if let Ok(text) = field.text().await { taken_at_explicit = Some(text); }
+                    continue;
+                }
+                if name == "file_mtime" {
+                    if let Ok(text) = field.text().await { mtime_fallback = Some(text); }
+                    continue;
+                }
+                if name == "folder_id" {
+                    if let Ok(text) = field.text().await { folder_id_override = Some(text); }
+                    continue;
+                }
+                if name != "file" { continue; }
 
-        let filename = field.file_name().unwrap_or("unknown").to_string();
-        let content_type = field.content_type().unwrap_or("application/octet-stream").to_string();
+                let filename = field.file_name().unwrap_or("unknown").to_string();
+                let content_type = field.content_type().unwrap_or("application/octet-stream").to_string();
 
-        match stream_upload(&state, field, &filename, &content_type,
-            taken_at_explicit.as_deref(), mtime_fallback.as_deref(),
-            folder_id_override.clone()).await {
-            Ok(Some(item)) => uploaded.push(item),
-            Ok(None) => {}
+                match stream_upload(&state, field, &filename, &content_type,
+                    taken_at_explicit.as_deref(), mtime_fallback.as_deref(),
+                    folder_id_override.clone()).await {
+                    Ok(Some(item)) => uploaded.push(item),
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!("upload failed for {filename}: {e}");
+                        errors.push(UploadError { filename: filename.clone(), error: e });
+                    }
+                }
+                // taken_at/file_mtime 是**每个文件自己的**权威时间，处理完即重置，
+                // 免得第 2..N 个文件继承第 1 个的拍摄时间（违反 §4.3 优先级）。
+                // folder_id 是本次请求的目标文件夹，对所有文件生效，不重置。
+                taken_at_explicit = None;
+                mtime_fallback = None;
+            }
+            Ok(None) => break,
             Err(e) => {
-                tracing::warn!("upload failed for {filename}: {e}");
-                errors.push(UploadError { filename: filename.clone(), error: e });
+                // multipart 流本身坏了（连接中断/客户端取消）：后面的 field 也读不到了。
+                // 旧写法 `while let Ok(Some(field))` 会静默退出，若已有文件成功就漏报这次中断。
+                tracing::warn!("upload multipart: {e}");
+                errors.push(UploadError { filename: String::new(), error: format!("multipart: {e}") });
+                break;
             }
         }
     }
@@ -377,6 +395,18 @@ async fn finalize_row(
     has_thumb: bool,
     folder_id: Option<String>,
 ) -> Result<Option<UploadItem>, String> {
+    // folder_id 防御：客户端传了不存在（或刚被删）的文件夹就落回根目录，
+    // 否则上传项指向虚空，在根视图和任何文件夹视图里都查不到 → 永久隐身。
+    let folder_id = match folder_id {
+        Some(fid) if !fid.is_empty() => {
+            match db::get_folder(&state.pool, &fid).await {
+                Ok(Some(_)) => Some(fid),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+
     let now = now_rfc3339();
     let row = MediaRow {
         id, filename, ext, mime: content_type.to_string(),
@@ -394,7 +424,28 @@ async fn finalize_row(
         folder_id,
     };
 
-    db::insert_media(&state.pool, &row).await.map_err(|e| format!("insert: {e}"))?;
+    let inserted = match db::insert_media(&state.pool, &row).await {
+        Ok(b) => b,
+        Err(e) => {
+            // 插入本身失败（磁盘满/库锁死等）：清掉已落地的文件+缩略图，
+            // 否则它们成了 purge（DB 驱动）永远看不到的孤儿。
+            let _ = fs::remove_file(state.media_dir.join(format!("{}.{}", row.id, row.ext))).await;
+            let _ = fs::remove_file(state.thumbs_dir.join(format!("{}.jpg", row.id))).await;
+            return Err(format!("insert: {e}"));
+        }
+    };
+    if !inserted {
+        // 并发去重竞态：唯一索引挡下了本次插入（同 checksum 的活行已被另一请求写入）。
+        // 清掉刚写的文件 + 缩略图，查回已存在的那条按 dedup 返回，绝不留下重复副本。
+        let _ = fs::remove_file(state.media_dir.join(format!("{}.{}", row.id, row.ext))).await;
+        let _ = fs::remove_file(state.thumbs_dir.join(format!("{}.jpg", row.id))).await;
+        if let Some(cs) = row.checksum.as_deref() {
+            if let Ok(Some(existing)) = db::find_by_checksum(&state.pool, cs).await {
+                return Ok(Some(UploadItem { row: existing, dedup: true }));
+            }
+        }
+        return Err("insert conflict: duplicate checksum".to_string());
+    }
     Ok(Some(UploadItem { row, dedup: false }))
 }
 
@@ -516,6 +567,21 @@ pub async fn update_media(
     Path(id): Path<String>,
     Json(body): Json<UpdateFields>,
 ) -> impl IntoResponse {
+    // 空 body 是客户端错误(400)，不是"资源不存在"(404)——update_fields 对两者都返回 false，
+    // 在这里先分流，免得把合法 id 的空 PATCH 误报成 404 让客户端以为项目没了。
+    if body.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "no fields to update"}))).into_response();
+    }
+    // 移动目标文件夹强校验：必须存在（与 batch_move 一致），否则项目指向虚空、从导航消失。
+    if let Some(Some(fid)) = &body.folder_id {
+        if !fid.is_empty() {
+            match db::get_folder(&state.pool, fid).await {
+                Ok(None) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "folder not found"}))).into_response(),
+                Err(e) => { tracing::error!("get_folder: {e}"); return StatusCode::INTERNAL_SERVER_ERROR.into_response(); }
+                _ => {}
+            }
+        }
+    }
     match db::update_fields(&state.pool, &id, &body).await {
         Ok(true) => {
             match db::get_media(&state.pool, &id).await {

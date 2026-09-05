@@ -29,3 +29,4 @@ mp4parse = "0.17"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 base64 = "0.22"
+bcrypt = "0.16"

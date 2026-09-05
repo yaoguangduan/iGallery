@@ -47,13 +47,15 @@ class MediaThumb extends StatelessWidget {
   final VoidCallback onTap;
   final VoidCallback onLongPress;
   final void Function(Offset globalPosition)? onSecondaryTap;
+  /// 选择态下点右上角圆圈切换选中（为空则圆圈不可点）。
+  final VoidCallback? onToggleSelect;
 
   const MediaThumb({
     super.key,
     required this.item, required this.service,
     required this.selected, required this.selecting,
     required this.prefs, required this.onTap, required this.onLongPress,
-    this.onSecondaryTap,
+    this.onSecondaryTap, this.onToggleSelect,
   });
 
   /// 窄于这个宽度就不画标签：字号调大后，3~5 行元信息会把
@@ -75,7 +77,7 @@ class MediaThumb extends StatelessWidget {
         prefs.labelPosition == LabelPosition.overlay &&
         tileWidth >= _labelMinTileWidth;
     final compact = tileWidth < _labelMinTileWidth;
-    return GestureDetector(
+    return QuickLongPress(
       onTap: onTap, onLongPress: onLongPress,
       onSecondaryTapDown: onSecondaryTap == null
           ? null
@@ -136,14 +138,22 @@ class MediaThumb extends StatelessWidget {
             if (!selecting && item.isFavorite)
               Positioned(right: 7, top: 7,
                   child: Icon(Icons.favorite, size: compact ? 12 : 15, color: c.onScrim)),
-            if (selecting) Positioned(right: 7, top: 7, child: Container(
-              width: compact ? 20 : 24, height: compact ? 20 : 24,
-              decoration: BoxDecoration(
-                color: selected ? c.brand : c.scrimSoft, shape: BoxShape.circle,
-                border: Border.all(color: c.onScrim, width: 1.5)),
-              child: selected
-                  ? Icon(Icons.check, size: compact ? 13 : 16, color: c.onScrim)
-                  : null,
+            if (selecting) Positioned(right: 0, top: 0, child: GestureDetector(
+              // 圆圈自带命中区：点它=切换选中，而不是打开查看器（旧版圆圈是纯装饰）
+              behavior: HitTestBehavior.opaque,
+              onTap: onToggleSelect,
+              child: Padding(
+                padding: const EdgeInsets.all(7),
+                child: Container(
+                  width: compact ? 20 : 24, height: compact ? 20 : 24,
+                  decoration: BoxDecoration(
+                    color: selected ? c.brand : c.scrimSoft, shape: BoxShape.circle,
+                    border: Border.all(color: c.onScrim, width: 1.5)),
+                  child: selected
+                      ? Icon(Icons.check, size: compact ? 13 : 16, color: c.onScrim)
+                      : null,
+                ),
+              ),
             )),
           ]),
           ),
@@ -244,18 +254,22 @@ class FolderThumb extends StatelessWidget {
                           borderRadius: BorderRadius.circular(AppRadius.card * 0.5),
                           child: SizedBox(
                             width: coverSide, height: coverSide,
-                            child: Stack(fit: StackFit.expand, children: [
-                              CachedThumb(
-                                id: folder.coverId!,
-                                url: service.thumbUrl(folder.coverId!),
-                                headers: service.authHeaders,
-                                placeholder: Container(color: c.surface),
-                                errorBuilder: (_) => Container(color: c.surface),
-                              ),
-                              if (folder.coverIsVideo)
-                                Center(child: Icon(Icons.play_arrow,
-                                    size: coverSide * 0.5, color: c.onScrim)),
-                            ]),
+                            // 加密文件夹:同一张缩略图,客户端打强马赛克+锁,不走服务端模糊图
+                            child: folder.hasPassword
+                                ? LockedCover(
+                                    coverId: folder.coverId!, service: service)
+                                : Stack(fit: StackFit.expand, children: [
+                                    CachedThumb(
+                                      id: folder.coverId!,
+                                      url: service.thumbUrl(folder.coverId!),
+                                      headers: service.authHeaders,
+                                      placeholder: Container(color: c.surface),
+                                      errorBuilder: (_) => Container(color: c.surface),
+                                    ),
+                                    if (folder.coverIsVideo)
+                                      Center(child: Icon(Icons.play_arrow,
+                                          size: coverSide * 0.5, color: c.onScrim)),
+                                  ]),
                           ),
                         ),
                       ),
@@ -318,6 +332,54 @@ class _FolderPainter extends CustomPainter {
   bool shouldRepaint(_FolderPainter old) => old.color != color;
 }
 
+/// 加密文件夹封面：普通缩略图在客户端打「强力马赛克」+ 中央白锁。
+/// 马赛克 = **解码期**真降采样到 8×8(cacheWidth/cacheHeight → ResizeImage)，
+/// 再最近邻采样(FilterQuality.none)放大填满，得到真色块。
+/// 注意不能用「塞进小 SizedBox + FittedBox 放大」的做法：那只是 canvas 变换，
+/// 光栅化时会合并成一次 300×300 原图→屏幕尺寸的单次采样，内容依然清晰可辨。
+/// 纯客户端效果，服务端不再生成/下发 _blur.jpg 模糊图。
+/// 网格 FolderThumb 与列表 _FolderListTile 共用这一份，不写两遍。
+class LockedCover extends StatelessWidget {
+  final String coverId;
+  final MediaService service;
+  const LockedCover({super.key, required this.coverId, required this.service});
+
+  /// 马赛克块数：8×8 在 60px 封面上每块 ~7.5px，够粗——看得出"是张图"但认不出内容
+  static const int _mosaicPx = 8;
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (ctx, box) {
+        final short =
+            box.maxWidth < box.maxHeight ? box.maxWidth : box.maxHeight;
+        return Stack(
+          fit: StackFit.expand,
+          children: [
+            CachedThumb(
+              id: coverId,
+              url: service.thumbUrl(coverId),
+              headers: service.authHeaders,
+              fit: BoxFit.cover,
+              filterQuality: FilterQuality.none,
+              cacheWidth: _mosaicPx,
+              cacheHeight: _mosaicPx,
+            ),
+            Center(
+              child: Icon(
+                Icons.lock_rounded,
+                color: Colors.white,
+                size: (short * 0.36).clamp(16.0, 26.0),
+                shadows: const [Shadow(color: Colors.black54, blurRadius: 4)],
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+}
+
 /// 移动到 ... 的文件夹选择器
 class FolderPickerSheet extends StatefulWidget {
   final MediaService service;
@@ -336,6 +398,7 @@ class _FolderPickerSheetState extends State<FolderPickerSheet> {
   final List<({String id, String name})> _path = [];
   bool _loading = true;
   bool _loadError = false;
+  int _loadSeq = 0; // 快速导航时丢弃过期响应，别让旧目录列表盖掉新目录
 
   @override
   void initState() {
@@ -344,17 +407,24 @@ class _FolderPickerSheetState extends State<FolderPickerSheet> {
   }
 
   Future<void> _load() async {
+    final seq = ++_loadSeq;
     setState(() { _loading = true; _loadError = false; });
+    List<FolderItem> list;
+    var error = false;
     try {
-      var list = await widget.service.listFolders(parentId: _browseFolderId);
+      list = await widget.service.listFolders(parentId: _browseFolderId);
       final ex = widget.excludeFolderId;
       if (ex != null) list = list.where((f) => f.id != ex).toList();
-      _folders = list;
     } catch (_) {
-      _loadError = true;
-      _folders = [];
+      error = true;
+      list = [];
     }
-    if (mounted) setState(() => _loading = false);
+    if (!mounted || seq != _loadSeq) return; // 过期结果丢弃
+    setState(() {
+      _folders = list;
+      _loadError = error;
+      _loading = false;
+    });
   }
 
   void _enter(FolderItem folder) {

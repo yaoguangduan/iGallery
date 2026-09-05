@@ -103,7 +103,33 @@ class HashSync extends ChangeNotifier {
     });
   }
 
+  // ── 本地 asset hash 缓存（内存 + SQLite）──
+
+  final Map<String, String> _assetCache = {};
+  bool _assetCacheWarmed = false;
+
+  Future<void> warmAssetCache() async {
+    if (_assetCacheWarmed) return;
+    final rows = await KvStore.instance.db.query(
+      'asset_hashes',
+      columns: ['asset_id', 'fingerprint', 'checksum'],
+    );
+    for (final row in rows) {
+      final id = row['asset_id'] as String;
+      final fp = row['fingerprint'] as String;
+      final cs = row['checksum'] as String;
+      if (isCanonical(cs)) _assetCache['$id|$fp'] = cs;
+    }
+    _assetCacheWarmed = true;
+  }
+
+  String? assetChecksumSync(String assetId, String fingerprint) {
+    return _assetCache['$assetId|$fingerprint'];
+  }
+
   Future<String?> assetChecksum(String assetId, String fingerprint) async {
+    final cached = _assetCache['$assetId|$fingerprint'];
+    if (cached != null) return cached;
     final rows = await KvStore.instance.db.query(
       'asset_hashes',
       columns: ['checksum'],
@@ -113,7 +139,9 @@ class HashSync extends ChangeNotifier {
     );
     if (rows.isEmpty) return null;
     final checksum = rows.first['checksum'] as String;
-    return isCanonical(checksum) ? checksum : null;
+    if (!isCanonical(checksum)) return null;
+    _assetCache['$assetId|$fingerprint'] = checksum;
+    return checksum;
   }
 
   Future<void> cacheAssetChecksum(
@@ -122,6 +150,7 @@ class HashSync extends ChangeNotifier {
     String checksum,
   ) async {
     if (!isCanonical(checksum)) return;
+    _assetCache['$assetId|$fingerprint'] = checksum;
     await KvStore.instance.db.insert('asset_hashes', {
       'asset_id': assetId,
       'fingerprint': fingerprint,

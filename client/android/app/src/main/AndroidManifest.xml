@@ -13,12 +13,26 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
 
+    <!-- 拍照 + 录像（image_picker 的 ImageSource.camera） -->
+    <uses-permission android:name="android.permission.CAMERA"/>
+    <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+    <uses-feature android:name="android.hardware.camera" android:required="false"/>
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false"/>
+    <uses-feature android:name="android.hardware.microphone" android:required="false"/>
+
     <!-- file_picker 选图片/视频上传 -->
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES"/>
     <uses-permission android:name="android.permission.READ_MEDIA_VIDEO"/>
     <uses-permission
         android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32"/>
+
+    <!-- 本地 tab 删除照片/视频：Android 12+ 授予「允许管理所有媒体文件」后，
+         MediaStore 删除请求由系统静默放行，photo_manager 删除不再每次弹「允许删除?」框。
+         前提 READ_MEDIA_*(上面)已持有。Android 11 及以下系统无免弹通道。
+         启动时检测并引导授权，见 core/media_permission.dart + MainActivity。
+         注意：不是 MANAGE_EXTERNAL_STORAGE —— 那个绕不开 createDeleteRequest 弹框。 -->
+    <uses-permission android:name="android.permission.MANAGE_MEDIA"/>
 
     <application
         android:label="igallery"
@@ -89,6 +103,12 @@
         <intent>
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>
+        </intent>
+        <intent>
+            <action android:name="android.media.action.IMAGE_CAPTURE"/>
+        </intent>
+        <intent>
+            <action android:name="android.media.action.VIDEO_CAPTURE"/>
         </intent>
     </queries>
 </manifest>

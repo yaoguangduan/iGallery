@@ -13,6 +13,14 @@ class CachedThumb extends StatefulWidget {
   final BoxFit fit;
   final Widget? placeholder;
   final Widget Function(BuildContext)? errorBuilder;
+  /// 采样质量。马赛克封面(LockedCover)靠 FilterQuality.none 的最近邻放大出块状效果,
+  /// 其余场景保持 Image 默认的 medium。
+  final FilterQuality filterQuality;
+  /// 解码期降采样目标尺寸(透传 Image.file → ResizeImage)。马赛克必须靠它在
+  /// **解码时**真降到 8×8,再配合 FilterQuality.none 放大出色块;只靠布局缩小
+  /// 是 canvas 变换,光栅化时会合并成一次原图→屏幕的采样,出不来马赛克。
+  final int? cacheWidth;
+  final int? cacheHeight;
   const CachedThumb({
     super.key,
     required this.id,
@@ -21,6 +29,9 @@ class CachedThumb extends StatefulWidget {
     this.fit = BoxFit.cover,
     this.placeholder,
     this.errorBuilder,
+    this.filterQuality = FilterQuality.medium,
+    this.cacheWidth,
+    this.cacheHeight,
   });
 
   @override
@@ -84,6 +95,9 @@ class _CachedThumbState extends State<CachedThumb> {
     }
     return Image.file(
       _file!, fit: widget.fit,
+      filterQuality: widget.filterQuality,
+      cacheWidth: widget.cacheWidth,
+      cacheHeight: widget.cacheHeight,
       // 换图时不要先闪一帧空白
       gaplessPlayback: true,
       errorBuilder: (ctx, _, __) =>

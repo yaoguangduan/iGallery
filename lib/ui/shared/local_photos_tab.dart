@@ -18,7 +18,6 @@ import 'app_toast.dart';
 import 'drag_select.dart';
 import 'folder_picker.dart';
 import 'gallery_view.dart';
-import 'preview_video.dart';
 
 class LocalPhotosTab extends StatefulWidget {
   final GalleryShellHost? shell;
@@ -51,7 +50,6 @@ class _LocalPhotosTabState extends State<LocalPhotosTab> {
   int _albumRequest = 0;
   String? _permissionError;
   bool _inited = false;
-  bool _bootstrapStarted = false; // #43 首次真正激活才 bootstrap（弹相册权限）
 
   int? _sweepAnchor;
   bool _sweepAdding = true;
@@ -73,9 +71,7 @@ class _LocalPhotosTabState extends State<LocalPhotosTab> {
     _wasUploading = UploadManager.instance.uploading;
     HashSync.instance.addListener(_onHashSyncChanged);
     UploadManager.instance.addListener(_onUploadChanged);
-    // #43 IndexedStack 启动即构建本 tab，但只有真的切到本地 tab 才 bootstrap。
-    // 否则 app 一启动就弹相册权限，用户还没用到本地功能就被打扰。
-    if (widget.active) _bootstrap();
+    _bootstrap();
   }
 
   @override
@@ -84,12 +80,7 @@ class _LocalPhotosTabState extends State<LocalPhotosTab> {
     if (oldWidget.active && !widget.active) {
       _hashVerifier.stop();
     } else if (!oldWidget.active && widget.active) {
-      // 首次激活 → bootstrap（请求权限+加载）；之后激活 → 增量刷新
-      if (_inited) {
-        _refreshAlbums();
-      } else {
-        _bootstrap();
-      }
+      _scheduleVisibleVerification();
     }
   }
 
@@ -120,107 +111,38 @@ class _LocalPhotosTabState extends State<LocalPhotosTab> {
     _wasUploading = uploading;
   }
 
-  Future<void> _refreshAlbums() async {
-    // tab 变 active 就全量重查一次相册列表。
-    // 关键：必须用"新查回来的" AssetPathEntity 去做计数对比和重载 ——
-    // 旧的 _album! 实例可能带着缓存的 assetCount，导致刚下载存进相册的
-    // 文件永远探测不到（"手动进去也没最新的"就是这个）。
-    // #36 刷新途中用户手动切了相册(_switchAlbum 会 ++_albumRequest)就放弃本次，别覆盖用户选择。
-    final request = _albumRequest;
-    try {
-      final albums = await PhotoManager.getAssetPathList(
-        type: RequestType.common,
-        hasAll: true,
-        filterOption: FilterOptionGroup(
-          orders: [
-            const OrderOption(type: OrderOptionType.createDate, asc: false),
-          ],
-        ),
-      );
-      if (!mounted || request != _albumRequest) return;
-      albums.sort((a, b) {
-        if (a.isAll != b.isAll) return a.isAll ? -1 : 1;
-        return a.name.compareTo(b.name);
-      });
-      setState(() => _albums = albums);
-
-      // 当前打开相册的新实体；相册没了就退回第一个
-      final targetId = _album?.id;
-      AssetPathEntity? fresh;
-      if (targetId != null) {
-        for (final a in albums) {
-          if (a.id == targetId) {
-            fresh = a;
-            break;
-          }
-        }
-      }
-      final next = fresh ?? (albums.isNotEmpty ? albums.first : null);
-      if (next == null) {
-        setState(() => _loading = false);
-        return;
-      }
-
-      // 相册变了，或数量变了（下载入库 +1）→ 整页重载，最新的排最前
-      final total = await next.assetCountAsync;
-      if (!mounted || request != _albumRequest) return;
-      if (next.id != _album?.id || total != _total) {
-        await _switchAlbum(next);
-        return;
-      }
-      _scheduleVisibleVerification();
-    } catch (_) {
-      if (mounted && request == _albumRequest) setState(() => _loading = false);
-    }
-  }
-
   Future<void> _bootstrap() async {
-    if (_bootstrapStarted) return; // 只跑一次（含权限请求），后续激活走 _refreshAlbums
-    _bootstrapStarted = true;
     final ps = await PhotoManager.requestPermissionExtend();
     if (!mounted) return;
     if (!ps.hasAccess) {
-      // 权限没给：复位 started，允许用户去设置开启后、再次切到本地 tab 时重新 bootstrap
-      _bootstrapStarted = false;
       setState(() {
         _loading = false;
         _permissionError = '没有相册访问权限';
       });
       return;
     }
-    // #35 取相册列表也可能抛（相册库异常等）：兜住并停掉转圈，给出错误态而不是永久 spinner
-    try {
-      final albums = await PhotoManager.getAssetPathList(
-        type: RequestType.common,
-        hasAll: true,
-        filterOption: FilterOptionGroup(
-          orders: [
-            const OrderOption(type: OrderOptionType.createDate, asc: false),
-          ],
-        ),
-      );
-      if (!mounted) return;
-      albums.sort((a, b) {
-        if (a.isAll != b.isAll) return a.isAll ? -1 : 1;
-        return a.name.compareTo(b.name);
-      });
-      setState(() {
-        _albums = albums;
-        _inited = true;
-      });
-      if (albums.isEmpty) {
-        setState(() => _loading = false);
-      } else {
-        await _switchAlbum(albums.first);
-      }
-    } catch (_) {
-      _bootstrapStarted = false; // 允许下次激活重试
-      if (mounted) {
-        setState(() {
-          _loading = false;
-          _permissionError = '本地相册加载失败';
-        });
-      }
+    final albums = await PhotoManager.getAssetPathList(
+      type: RequestType.common,
+      hasAll: true,
+      filterOption: FilterOptionGroup(
+        orders: [
+          const OrderOption(type: OrderOptionType.createDate, asc: false),
+        ],
+      ),
+    );
+    if (!mounted) return;
+    albums.sort((a, b) {
+      if (a.isAll != b.isAll) return a.isAll ? -1 : 1;
+      return a.name.compareTo(b.name);
+    });
+    setState(() {
+      _albums = albums;
+      _inited = true;
+    });
+    if (albums.isEmpty) {
+      setState(() => _loading = false);
+    } else {
+      await _switchAlbum(albums.first);
     }
   }
 
@@ -262,36 +184,32 @@ class _LocalPhotosTabState extends State<LocalPhotosTab> {
 
   Future<void> _loadMore() async {
     final album = _album;
-    // 不再用 _assets.length >= _total 当停止条件：_total 是切相册那刻的快照，
-    // 之后新下载/新拍的照片会让它偏小，导致"以为加载完了"而漏掉后面的。
-    if (_loadingMore || _pagingBlocked || album == null) {
+    if (_loadingMore ||
+        _pagingBlocked ||
+        album == null ||
+        _assets.length >= _total) {
       return;
     }
     final request = _albumRequest;
     final next = _page + 1;
-    var rawCount = 0;
-    var freshCount = 0;
+    var loadedPage = false;
     setState(() => _loadingMore = true);
     try {
       final list = await album.getAssetListPaged(page: next, size: _pageSize);
       if (!mounted || request != _albumRequest || album.id != _album?.id) {
         return;
       }
-      rawCount = list.length;
       final loadedIds = _assets.map((asset) => asset.id).toSet();
       final fresh = list
           .where((asset) => loadedIds.add(asset.id))
           .toList(growable: false);
-      freshCount = fresh.length;
       _fillFromCache(fresh);
       setState(() {
         _page = next;
         _assets.addAll(fresh);
-        if (_assets.length > _total) _total = _assets.length; // 显示用下限，避免 N/总数 倒挂
-        // 到头的可靠信号是"原生返回空页"。整页都是重复(边界因新增项错位)不算到头，
-        // 旧写法在这里 _pagingBlocked=true，会把后面还没加载的照片永久藏住。
-        _pagingBlocked = list.isEmpty;
+        _pagingBlocked = fresh.isEmpty && _assets.length < _total;
       });
+      loadedPage = fresh.isNotEmpty;
       _syncSelection();
     } catch (_) {
       if (mounted && request == _albumRequest) {
@@ -300,9 +218,10 @@ class _LocalPhotosTabState extends State<LocalPhotosTab> {
     } finally {
       if (mounted && request == _albumRequest) {
         setState(() => _loadingMore = false);
-        if (freshCount > 0) _scheduleAllVerification();
-        // 这页只要原生返回了数据(哪怕全重复)就可能还有下一页，继续尝试填满视口
-        if (rawCount > 0) _scheduleLocalViewportFill();
+        if (loadedPage) {
+          _scheduleLocalViewportFill();
+          _scheduleAllVerification();
+        }
       }
     }
   }
@@ -315,7 +234,7 @@ class _LocalPhotosTabState extends State<LocalPhotosTab> {
           _pagingBlocked) {
         return;
       }
-      if (_scrollCtrl.position.extentAfter <= 400) {
+      if (_assets.length < _total && _scrollCtrl.position.extentAfter <= 400) {
         _loadMore();
       }
     });
@@ -458,58 +377,37 @@ class _LocalPhotosTabState extends State<LocalPhotosTab> {
 
   // ── 预览 ──
 
-  // 点开即进入整册 PageView 预览，可左右滑动切换，右上角圆圈勾选当前项
-  // （与上传选择器的预览一致）。返回时同步选择态；若删了文件则整页重载。
   Future<void> _previewAsset(AssetEntity asset) async {
-    final idx = _assets.indexOf(asset);
-    if (idx < 0) return;
-    // 共享持有者：预览直接在上面勾选/删除，pop（返回按钮或 iOS 侧滑）后读它同步回来。
-    // 不再依赖 pop 的返回值 —— 侧滑返回带不回结果，用持有者才不会丢改动（#44）。
-    final sync = _LocalPreviewResult(Set<String>.from(_selectedIds), <String>[]);
-    await Navigator.of(context).push<void>(
+    final file = await asset.file;
+    if (file == null || !mounted) return;
+    final deleted = await Navigator.of(context).push<bool>(
       MaterialPageRoute(
-        builder: (_) => _LocalPreviewPage(
-          assets: _assets,
-          initialIndex: idx,
-          sync: sync,
-          assetChecksums: _assetChecksums,
+        builder: (_) => _LocalPreviewPage(file: file, asset: asset),
+      ),
+    );
+    if (deleted == true && mounted && _album != null) {
+      _switchAlbum(_album!);
+    }
+  }
+
+  Future<void> _previewAssetInSelection(AssetEntity asset) async {
+    final file = await asset.file;
+    if (file == null || !mounted) return;
+    final selected = _selectedIds.contains(asset.id);
+    final result = await Navigator.of(context).push<_SelectionPreviewResult>(
+      MaterialPageRoute(
+        builder: (_) => _SelectionPreviewPage(
+          file: file,
+          asset: asset,
+          selected: selected,
+          selectedCount: _selected.length,
         ),
       ),
     );
     if (!mounted) return;
-    if (sync.deletedIds.isNotEmpty && _album != null) {
-      await _switchAlbum(_album!); // 重载会清空选择
-      if (!mounted) return;
-      // #6 预览里删了某项，不该连累其它已选项：把重载后仍存在的、原本选中的重新勾上
-      final deleted = sync.deletedIds.toSet();
-      final keep = sync.selectedIds.where((id) => !deleted.contains(id)).toSet();
-      if (keep.isNotEmpty) {
-        setState(() {
-          _selectedIds.clear();
-          _selected.clear();
-          for (final a in _assets) {
-            if (keep.contains(a.id)) {
-              _selectedIds.add(a.id);
-              _selected.add(a);
-            }
-          }
-        });
-        _syncSelection();
-      }
-      return;
+    if (result != null) {
+      if (result.selected != selected) _toggle(asset);
     }
-    // 同步预览里的勾选变化（按 _assets 顺序重建有序选择列表）
-    setState(() {
-      _selectedIds.clear();
-      _selected.clear();
-      for (final a in _assets) {
-        if (sync.selectedIds.contains(a.id)) {
-          _selectedIds.add(a.id);
-          _selected.add(a);
-        }
-      }
-    });
-    _syncSelection();
   }
 
   // ── 上传选中项 ──
@@ -855,7 +753,13 @@ class _LocalPhotosTabState extends State<LocalPhotosTab> {
     final uploaded = checksum != null && HashSync.instance.contains(checksum);
     final isVideo = asset.type == AssetType.video;
     return QuickLongPress(
-      onTap: () => _previewAsset(asset),
+      onTap: () {
+        if (_selecting) {
+          _previewAssetInSelection(asset);
+        } else {
+          _previewAsset(asset);
+        }
+      },
       onLongPress: () {
         HapticFeedback.mediumImpact();
         if (!_selecting) setState(() {});
@@ -886,35 +790,28 @@ class _LocalPhotosTabState extends State<LocalPhotosTab> {
             const Positioned(left: 4, top: 4, child: UploadedBadge()),
           if (_selecting)
             Positioned(
-              right: 0,
-              top: 0,
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: () => _toggle(asset),
-                child: Padding(
-                  padding: const EdgeInsets.all(4),
-                  child: Container(
-                    width: 22,
-                    height: 22,
-                    decoration: BoxDecoration(
-                      color: selected ? c.brand : c.scrimSoft,
-                      shape: BoxShape.circle,
-                      border: Border.all(color: c.onScrim, width: 1.5),
-                    ),
-                    child: selected
-                        ? Center(
-                            child: Text(
-                              '${selIdx + 1}',
-                              style: TextStyle(
-                                color: c.onScrim,
-                                fontSize: AppType.xxs,
-                                fontWeight: FontWeight.w600,
-                              ),
-                            ),
-                          )
-                        : null,
-                  ),
+              right: 4,
+              top: 4,
+              child: Container(
+                width: 22,
+                height: 22,
+                decoration: BoxDecoration(
+                  color: selected ? c.brand : c.scrimSoft,
+                  shape: BoxShape.circle,
+                  border: Border.all(color: c.onScrim, width: 1.5),
                 ),
+                child: selected
+                    ? Center(
+                        child: Text(
+                          '${selIdx + 1}',
+                          style: TextStyle(
+                            color: c.onScrim,
+                            fontSize: AppType.xxs,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      )
+                    : null,
               ),
             ),
         ],
@@ -1012,218 +909,61 @@ class _AlbumCoverState extends State<_AlbumCover> {
   }
 }
 
-/// 预览与网格之间的**共享可变状态**：勾选集 + 被删列表。
-/// 预览直接改这个持有者、上层在 pop 之后读它 —— 不再依赖 Navigator 的 pop 返回值，
-/// 这样 iOS 侧滑返回（无法携带返回值）也不会丢掉预览里的勾选/删除（#44）。
-class _LocalPreviewResult {
-  final Set<String> selectedIds;
-  final List<String> deletedIds;
-  _LocalPreviewResult(this.selectedIds, this.deletedIds);
-}
-
-/// 本地整册预览：PageView 左右滑动切换（与上传选择器一致），
-/// 右上角圆圈勾选当前项，顶栏保留本地特有的上传/分享/删除。
 class _LocalPreviewPage extends StatefulWidget {
-  final List<AssetEntity> assets;
-  final int initialIndex;
-  final _LocalPreviewResult sync;
-  final Map<String, String> assetChecksums;
-
-  const _LocalPreviewPage({
-    required this.assets,
-    required this.initialIndex,
-    required this.sync,
-    required this.assetChecksums,
-  });
+  final File file;
+  final AssetEntity asset;
+  const _LocalPreviewPage({required this.file, required this.asset});
 
   @override
   State<_LocalPreviewPage> createState() => _LocalPreviewPageState();
 }
 
 class _LocalPreviewPageState extends State<_LocalPreviewPage> {
-  late final PageController _pageCtrl;
-  // 勾选/删除直接读写共享持有者，pop（按钮或侧滑）后上层据此同步
-  Set<String> get _selected => widget.sync.selectedIds;
-  List<String> get _deletedIds => widget.sync.deletedIds;
-  // 预览内持有资源列表的可变副本：删除只从这里摘，上层据 deletedIds 重载
-  late final List<AssetEntity> _assets;
-  late int _current;
-
   Player? _player;
-  VideoController? _videoCtrl;
+  VideoController? _controller;
+
+  bool get _isVideo => widget.asset.type == AssetType.video;
 
   @override
   void initState() {
     super.initState();
-    _assets = List<AssetEntity>.from(widget.assets);
-    _current = widget.initialIndex;
-    _pageCtrl = PageController(initialPage: _current);
-    _prepareVideo(_current);
+    if (_isVideo) {
+      _player = Player();
+      _controller = VideoController(_player!);
+      _player!.open(Media(widget.file.path), play: true);
+    }
   }
 
   @override
   void dispose() {
     _player?.dispose();
-    _pageCtrl.dispose();
     super.dispose();
   }
 
-  AssetEntity get _asset => _assets[_current];
-
-  bool get _isUploaded {
-    final checksum = widget.assetChecksums[_asset.id];
-    return checksum != null && HashSync.instance.contains(checksum);
-  }
-
-  void _prepareVideo(int index) {
-    final asset = _assets[index];
-    if (asset.type == AssetType.video) {
-      _player?.dispose();
-      final player = Player();
-      _player = player;
-      _videoCtrl = VideoController(player);
-      asset.file.then((f) {
-        // 异步取文件期间可能已滑走：仅当此 player 仍是当前、页码没变才 open，
-        // 否则 _player! 可能已置空(崩溃)或把上一条视频塞进新 player(放错)。
-        if (f != null && mounted && _player == player && _current == index) {
-          player.open(Media(f.path), play: true);
-        }
-      });
-    } else {
-      _player?.dispose();
-      _player = null;
-      _videoCtrl = null;
-    }
-  }
-
-  void _onPageChanged(int index) {
-    setState(() => _current = index);
-    _prepareVideo(index);
-  }
-
-  // 不再回传结果：勾选/删除都写在共享的 widget.sync 上，上层 pop 后自取
-  void _close() => Navigator.pop(context);
-
-  void _toggleCurrent() {
-    final id = _asset.id;
-    setState(() {
-      if (_selected.contains(id)) {
-        _selected.remove(id);
-      } else {
-        _selected.add(id);
-      }
-    });
-  }
-
-  /// 有选中即视为选择态：顶栏只留选择圈，批量操作走底部横向操作栏
-  bool get _selecting => _selected.isNotEmpty;
-
-  void _toggleSelectAll() {
-    setState(() {
-      if (_selected.length == _assets.length) {
-        _selected.clear();
-      } else {
-        _selected
-          ..clear()
-          ..addAll(_assets.map((a) => a.id));
-      }
-    });
-  }
-
-  Future<void> _uploadSelected() async {
-    final targets = _assets.where((a) => _selected.contains(a.id)).toList();
-    if (targets.isEmpty) return;
-    final files = <PendingUpload>[];
-    for (final a in targets) {
-      try {
-        final f = await a.file;
-        if (f != null) {
-          files.add(PendingUpload(
-            f,
-            takenAtIso: toServerRfc3339(a.createDateTime),
-            assetId: a.id,
-            assetFingerprint: assetFingerprint(a),
-          ));
-        }
-      } catch (_) {}
-    }
-    if (!mounted) return;
-    if (files.isEmpty) {
-      showToast(context, '无法读取所选文件', kind: ToastKind.error);
-      return;
-    }
-    await showFolderPickerAndUpload(context, files);
-  }
-
-  Future<void> _deleteSelected() async {
-    final targets = _assets.where((a) => _selected.contains(a.id)).toList();
-    if (targets.isEmpty) return;
-    final ok = await appConfirmDialog(
-      context,
-      title: '删除本地文件',
-      message: '确定删除选中的 ${targets.length} 个？已上传到服务器的不受影响。',
-      confirmLabel: '删除',
-      destructive: true,
-    );
-    if (!ok || !mounted) return;
-    try {
-      final deleted = await PhotoManager.editor
-          .deleteWithIds(targets.map((a) => a.id).toList());
-      if (!mounted) return;
-      final deletedSet = deleted.toSet();
-      if (deletedSet.isEmpty) {
-        showToast(context, '删除失败', kind: ToastKind.error);
-        return;
-      }
-      _deletedIds.addAll(deletedSet);
-      setState(() {
-        _assets.removeWhere((a) => deletedSet.contains(a.id));
-        _selected.removeWhere(deletedSet.contains);
-        if (_assets.isEmpty) {
-          _current = 0;
-        } else if (_current >= _assets.length) {
-          _current = _assets.length - 1;
-        }
-      });
-      if (_assets.isEmpty) {
-        showToast(context, '已删除 ${deletedSet.length} 个', kind: ToastKind.success);
-        _close();
-        return;
-      }
-      _prepareVideo(_current);
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted && _pageCtrl.hasClients) _pageCtrl.jumpToPage(_current);
-      });
-      showToast(context, '已删除 ${deletedSet.length} 个', kind: ToastKind.success);
-    } catch (e) {
-      if (mounted) showToast(context, '删除失败: $e', kind: ToastKind.error);
-    }
-  }
-
   Future<void> _upload() async {
-    final asset = _asset;
-    final file = await asset.file;
-    if (file == null || !mounted) return;
+    final file = widget.file;
+    final takenAt = toServerRfc3339(widget.asset.createDateTime);
+    final fp = assetFingerprint(widget.asset);
+    if (!mounted) return;
     await showFolderPickerAndUpload(context, [
       PendingUpload(
         file,
-        takenAtIso: toServerRfc3339(asset.createDateTime),
-        assetId: asset.id,
-        assetFingerprint: assetFingerprint(asset),
+        takenAtIso: takenAt,
+        assetId: widget.asset.id,
+        assetFingerprint: fp,
       ),
     ]);
   }
 
   Future<void> _share() async {
-    final asset = _asset;
-    final file = await asset.file;
-    if (file == null || !mounted) return;
-    final mime = asset.type == AssetType.video ? 'video/*' : 'image/*';
-    await Share.shareXFiles([XFile(file.path, mimeType: mime)]);
+    final file = widget.file;
+    final mime = _isVideo ? 'video/*' : 'image/*';
+    await Share.shareXFiles(
+      [XFile(file.path, mimeType: mime)],
+    );
   }
 
   Future<void> _delete() async {
-    final asset = _asset;
     final ok = await appConfirmDialog(
       context,
       title: '删除本地文件',
@@ -1233,33 +973,14 @@ class _LocalPreviewPageState extends State<_LocalPreviewPage> {
     );
     if (!ok || !mounted) return;
     try {
-      final deleted = await PhotoManager.editor.deleteWithIds([asset.id]);
+      final deleted = await PhotoManager.editor.deleteWithIds([widget.asset.id]);
       if (!mounted) return;
-      if (deleted.isEmpty) {
-        showToast(context, '删除失败', kind: ToastKind.error);
-        return;
-      }
-      _deletedIds.add(asset.id);
-      _selected.remove(asset.id);
-      // 用 indexOf(asset) 而非 _current：删除的两个 await 期间用户可能已滑动，_current 变了，
-      // 用 _current 会把当前显示的那项从列表里摘掉、真正删掉的反而留着（点它→导出失败）。
-      final removedIndex = _assets.indexOf(asset);
-      _assets.remove(asset);
-      if (_assets.isEmpty) {
+      if (deleted.isNotEmpty) {
         showToast(context, '已删除', kind: ToastKind.success);
-        _close();
-        return;
+        Navigator.pop(context, true);
+      } else {
+        showToast(context, '删除失败', kind: ToastKind.error);
       }
-      // 停在原下标（后一项滑进来）；删的是末尾则回退一格
-      final nextIndex =
-          removedIndex < _assets.length ? removedIndex : _assets.length - 1;
-      setState(() => _current = nextIndex);
-      _prepareVideo(nextIndex);
-      // 等 PageView 按新 itemCount 重建后再跳，避免越界
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted && _pageCtrl.hasClients) _pageCtrl.jumpToPage(nextIndex);
-      });
-      showToast(context, '已删除', kind: ToastKind.success);
     } catch (e) {
       if (mounted) showToast(context, '删除失败: $e', kind: ToastKind.error);
     }
@@ -1267,15 +988,119 @@ class _LocalPreviewPageState extends State<_LocalPreviewPage> {
 
   @override
   Widget build(BuildContext context) {
-    final c = context.colors;
-    final asset = _asset;
-    final isSelected = _selected.contains(asset.id);
-    final selecting = _selecting;
+    return AnnotatedRegion<SystemUiOverlayStyle>(
+      value: SystemUiOverlayStyle.light,
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        extendBodyBehindAppBar: true,
+        appBar: AppBar(
+          backgroundColor: Colors.transparent,
+          foregroundColor: Colors.white,
+          elevation: 0,
+          title: Text(
+            widget.asset.title ?? widget.file.path.split('/').last,
+            style: const TextStyle(fontSize: 14, color: Colors.white70),
+          ),
+          actions: [
+            IconButton(
+              onPressed: _upload,
+              icon: const Icon(Icons.upload_rounded, size: 22),
+              tooltip: '上传',
+            ),
+            IconButton(
+              onPressed: _share,
+              icon: const Icon(Icons.share, size: 20),
+              tooltip: '分享',
+            ),
+            IconButton(
+              onPressed: _delete,
+              icon: const Icon(Icons.delete_outline, size: 22),
+              tooltip: '删除',
+            ),
+          ],
+        ),
+        body: _isVideo
+            ? Video(
+                controller: _controller!,
+                fill: Colors.black,
+                controls: AdaptiveVideoControls,
+              )
+            : PhotoView(
+                imageProvider: FileImage(widget.file),
+                minScale: PhotoViewComputedScale.contained,
+                maxScale: PhotoViewComputedScale.covered * 3,
+                backgroundDecoration: const BoxDecoration(color: Colors.black),
+              ),
+      ),
+    );
+  }
+}
 
-    // canPop:true —— 勾选/删除都写在共享持有者 widget.sync 上，不靠 pop 回传值，
-    // 因此可以放开 iOS 侧滑返回/系统返回（旧的 canPop:false 会把侧滑手势一起禁掉，#44）。
+// ── 选择态预览 ──
+
+class _SelectionPreviewResult {
+  final bool selected;
+  _SelectionPreviewResult({required this.selected});
+}
+
+class _SelectionPreviewPage extends StatefulWidget {
+  final File file;
+  final AssetEntity asset;
+  final bool selected;
+  final int selectedCount;
+
+  const _SelectionPreviewPage({
+    required this.file,
+    required this.asset,
+    required this.selected,
+    required this.selectedCount,
+  });
+
+  @override
+  State<_SelectionPreviewPage> createState() => _SelectionPreviewPageState();
+}
+
+class _SelectionPreviewPageState extends State<_SelectionPreviewPage> {
+  Player? _player;
+  VideoController? _controller;
+  late bool _selected;
+
+  bool get _isVideo => widget.asset.type == AssetType.video;
+
+  @override
+  void initState() {
+    super.initState();
+    _selected = widget.selected;
+    if (_isVideo) {
+      _player = Player();
+      _controller = VideoController(_player!);
+      _player!.open(Media(widget.file.path), play: true);
+    }
+  }
+
+  @override
+  void dispose() {
+    _player?.dispose();
+    super.dispose();
+  }
+
+  void _toggleSelect() {
+    setState(() => _selected = !_selected);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.colors;
+    final count = widget.selectedCount + (_selected != widget.selected
+        ? (_selected ? 1 : -1)
+        : 0);
     return PopScope(
-      canPop: true,
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) {
+          Navigator.pop(context, _SelectionPreviewResult(selected: _selected));
+        }
+      },
       child: AnnotatedRegion<SystemUiOverlayStyle>(
         value: SystemUiOverlayStyle.light,
         child: Scaffold(
@@ -1285,205 +1110,39 @@ class _LocalPreviewPageState extends State<_LocalPreviewPage> {
             backgroundColor: Colors.transparent,
             foregroundColor: Colors.white,
             elevation: 0,
-            title: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                if (_isUploaded)
-                  const Padding(
-                    padding: EdgeInsets.only(right: 8),
-                    child: UploadedBadge(size: 22),
-                  ),
-                Flexible(
-                  child: Text(
-                    selecting ? '已选 ${_selected.length}' : (asset.title ?? ''),
-                    style: TextStyle(
-                      fontSize: 14,
-                      color: selecting ? Colors.white : Colors.white70,
-                      fontWeight: selecting ? FontWeight.w600 : FontWeight.w400,
-                    ),
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ),
-              ],
+            title: Text(
+              '已选 $count',
+              style: const TextStyle(fontSize: 16, color: Colors.white),
             ),
             actions: [
               IconButton(
-                onPressed: _toggleCurrent,
+                onPressed: _toggleSelect,
                 icon: Icon(
-                  isSelected
+                  _selected
                       ? Icons.check_circle
                       : Icons.radio_button_unchecked,
-                  color: isSelected ? c.brand : Colors.white70,
+                  color: _selected ? c.brand : Colors.white70,
                   size: 26,
                 ),
-                tooltip: isSelected ? '取消选择' : '选择',
+                tooltip: _selected ? '取消选择' : '选择',
               ),
-              // 选择态右上角只留选择圈；单张的上传/分享/删除收起，批量操作走底部横向操作栏
-              if (!selecting) ...[
-                IconButton(
-                  onPressed: _upload,
-                  icon: const Icon(Icons.upload_rounded, size: 22),
-                  tooltip: '上传',
-                ),
-                IconButton(
-                  onPressed: _share,
-                  icon: const Icon(Icons.share, size: 20),
-                  tooltip: '分享',
-                ),
-                IconButton(
-                  onPressed: _delete,
-                  icon: const Icon(Icons.delete_outline, size: 22),
-                  tooltip: '删除',
-                ),
-              ],
             ],
           ),
-          body: Stack(
-            children: [
-              PageView.builder(
-                controller: _pageCtrl,
-                itemCount: _assets.length,
-                onPageChanged: _onPageChanged,
-                itemBuilder: (ctx, i) {
-                  final a = _assets[i];
-                  if (a.type == AssetType.video &&
-                      i == _current &&
-                      _videoCtrl != null &&
-                      _player != null) {
-                    return PreviewVideo(player: _player!, controller: _videoCtrl!);
-                  }
-                  // 非当前页的视频用缩略图当海报，绝不把整条视频导出成图片解码（卡+闪碎图）
-                  if (a.type == AssetType.video) {
-                    return _AssetThumb(key: ValueKey(a.id), asset: a);
-                  }
-                  return _LocalPreviewImage(asset: a);
-                },
-              ),
-              // 选择态横向操作栏（与本地网格一致）：全选 / 上传 / 删除
-              if (selecting)
-                Positioned(
-                  left: 0,
-                  right: 0,
-                  bottom: 0,
-                  child: _PreviewSelectionBar(
-                    allSelected: _selected.length == _assets.length,
-                    onToggleAll: _toggleSelectAll,
-                    onUpload: _uploadSelected,
-                    onDelete: _deleteSelected,
-                  ),
+          body: _isVideo
+              ? Video(
+                  controller: _controller!,
+                  fill: Colors.black,
+                  controls: AdaptiveVideoControls,
+                )
+              : PhotoView(
+                  imageProvider: FileImage(widget.file),
+                  minScale: PhotoViewComputedScale.contained,
+                  maxScale: PhotoViewComputedScale.covered * 3,
+                  backgroundDecoration:
+                      const BoxDecoration(color: Colors.black),
                 ),
-            ],
-          ),
         ),
       ),
-    );
-  }
-}
-
-/// 本地预览选择态的底部横向操作栏：全选 / 上传 / 删除（黑底白字，与查看器同属深色空间）。
-class _PreviewSelectionBar extends StatelessWidget {
-  final bool allSelected;
-  final VoidCallback onToggleAll;
-  final VoidCallback onUpload;
-  final VoidCallback onDelete;
-
-  const _PreviewSelectionBar({
-    required this.allSelected,
-    required this.onToggleAll,
-    required this.onUpload,
-    required this.onDelete,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return SafeArea(
-      top: false,
-      child: Container(
-        height: 60,
-        color: Colors.black54,
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-          children: [
-            _action(
-              icon: allSelected ? Icons.deselect : Icons.select_all,
-              label: allSelected ? '取消全选' : '全选已加载',
-              color: Colors.white,
-              onTap: onToggleAll,
-            ),
-            _action(
-              icon: Icons.upload_rounded,
-              label: '上传',
-              color: const Color(0xFF5B9DFF),
-              onTap: onUpload,
-            ),
-            _action(
-              icon: Icons.delete_outline,
-              label: '删除',
-              color: const Color(0xFFFF6B6B),
-              onTap: onDelete,
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _action({
-    required IconData icon,
-    required String label,
-    required Color color,
-    required VoidCallback onTap,
-  }) {
-    return Expanded(
-      child: GestureDetector(
-        behavior: HitTestBehavior.opaque,
-        onTap: onTap,
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(icon, size: 22, color: color),
-            const SizedBox(height: 2),
-            Text(label, style: TextStyle(fontSize: 10, color: color)),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-/// 预览页的单张图片：异步取本地文件再交给 PhotoView（可缩放）。
-class _LocalPreviewImage extends StatefulWidget {
-  final AssetEntity asset;
-  const _LocalPreviewImage({required this.asset});
-
-  @override
-  State<_LocalPreviewImage> createState() => _LocalPreviewImageState();
-}
-
-class _LocalPreviewImageState extends State<_LocalPreviewImage> {
-  File? _file;
-
-  @override
-  void initState() {
-    super.initState();
-    widget.asset.file.then((f) {
-      if (mounted && f != null) setState(() => _file = f);
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final f = _file;
-    if (f == null) {
-      return const Center(
-        child: CircularProgressIndicator(color: Colors.white38),
-      );
-    }
-    return PhotoView(
-      imageProvider: FileImage(f),
-      minScale: PhotoViewComputedScale.contained,
-      maxScale: PhotoViewComputedScale.covered * 3,
-      backgroundDecoration: const BoxDecoration(color: Colors.black),
     );
   }
 }

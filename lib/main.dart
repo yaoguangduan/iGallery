@@ -45,6 +45,7 @@ Future<void> main() async {
     // 否则用户会一直看到永远转圈的假记录
     await UploadHistory.markStalePending();
     await HashSync.instance.loadLocal();
+    unawaited(HashSync.instance.warmAssetCache());
 
     final displayPrefs = DisplayPrefs();
     await displayPrefs.load();

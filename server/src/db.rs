@@ -31,6 +31,10 @@ pub async fn init_pool(data_dir: &Path) -> Result<SqlitePool, sqlx::Error> {
          WHERE taken_at IS NULL AND deleted_at IS NULL"
     ).execute(&pool).await.ok();
 
+    // 文件夹密码支持
+    sqlx::query("ALTER TABLE folders ADD COLUMN password_hash TEXT")
+        .execute(&pool).await.ok();
+
     for idx in INDEXES {
         sqlx::query(idx).execute(&pool).await.ok();
     }
@@ -99,6 +103,11 @@ const INDEXES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_media_ext         ON media(ext)",
     "CREATE INDEX IF NOT EXISTS idx_media_favorite    ON media(favorite)",
     "CREATE INDEX IF NOT EXISTS idx_media_checksum    ON media(checksum)",
+    // 活行内同内容只允许一条：并发秒传时两个请求可能都过了 find_by_checksum 的读检查，
+    // 靠这个部分唯一索引 + INSERT OR IGNORE 兜底，避免重复行/重复文件。
+    // 也正好服务 find_by_checksum(WHERE checksum=? AND deleted_at IS NULL)。
+    // 历史库若已有重复，创建会失败，被 init_pool 的 .ok() 容忍（该库暂不获竞态保护，不影响正确性）。
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_media_checksum_live ON media(checksum) WHERE deleted_at IS NULL AND checksum IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS idx_media_gps         ON media(exif_gps_lat, exif_gps_lng)",
     "CREATE INDEX IF NOT EXISTS idx_media_folder_id   ON media(folder_id)",
 ];
@@ -153,6 +162,7 @@ pub struct FolderRow {
     pub parent_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    pub password_hash: Option<String>,
 }
 
 // ── CRUD ──
@@ -162,9 +172,12 @@ taken_at,created_at,updated_at,deleted_at,checksum,\
 exif_make,exif_model,exif_lens,exif_focal_length,exif_aperture,exif_iso,exif_exposure,\
 exif_gps_lat,exif_gps_lng,favorite,tags,notes,has_thumb,folder_id";
 
-pub async fn insert_media(pool: &SqlitePool, r: &MediaRow) -> Result<(), sqlx::Error> {
-    sqlx::query(&format!(
-        "INSERT OR REPLACE INTO media ({ALL_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+/// 写入一条新媒体行。返回 true=已插入；false=被唯一索引挡下（同 checksum 的活行已存在，
+/// 即并发去重竞态里另一请求先插了）。用 OR IGNORE 而非 OR REPLACE：REPLACE 在 checksum
+/// 冲突时会把已存在的行连 id 一起删掉重插，反而制造指向旧文件的孤儿。
+pub async fn insert_media(pool: &SqlitePool, r: &MediaRow) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query(&format!(
+        "INSERT OR IGNORE INTO media ({ALL_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
     ))
     .bind(&r.id).bind(&r.filename).bind(&r.ext).bind(&r.mime).bind(&r.media_type)
     .bind(r.size).bind(r.width).bind(r.height).bind(r.duration).bind(r.orientation)
@@ -174,7 +187,7 @@ pub async fn insert_media(pool: &SqlitePool, r: &MediaRow) -> Result<(), sqlx::E
     .bind(r.exif_gps_lat).bind(r.exif_gps_lng)
     .bind(r.favorite).bind(&r.tags).bind(&r.notes).bind(r.has_thumb).bind(&r.folder_id)
     .execute(pool).await?;
-    Ok(())
+    Ok(res.rows_affected() > 0)
 }
 
 pub async fn get_media(pool: &SqlitePool, id: &str) -> Result<Option<MediaRow>, sqlx::Error> {
@@ -210,7 +223,14 @@ pub async fn soft_delete_many(pool: &SqlitePool, ids: &[String]) -> Result<u64, 
 
 pub async fn restore(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
     let now = now_rfc3339();
-    let r = sqlx::query("UPDATE media SET deleted_at = NULL, updated_at = ? WHERE id = ? AND deleted_at IS NOT NULL")
+    // 恢复时若所属文件夹已被删除（delete_folder_tree 硬删了 folders 行），把 folder_id 置空，
+    // 否则项目指向不存在的文件夹，在根目录(folder_id IS NULL)和任何文件夹视图里都查不到 → 永久隐身。
+    let r = sqlx::query(
+        "UPDATE media SET deleted_at = NULL, updated_at = ?, \
+         folder_id = CASE WHEN folder_id IS NOT NULL AND NOT EXISTS \
+             (SELECT 1 FROM folders WHERE folders.id = media.folder_id) \
+             THEN NULL ELSE folder_id END \
+         WHERE id = ? AND deleted_at IS NOT NULL")
         .bind(&now).bind(id).execute(pool).await?;
     Ok(r.rows_affected() > 0)
 }
@@ -316,7 +336,7 @@ pub async fn insert_folder(pool: &SqlitePool, r: &FolderRow) -> Result<(), sqlx:
 }
 
 pub async fn get_folder(pool: &SqlitePool, id: &str) -> Result<Option<FolderRow>, sqlx::Error> {
-    sqlx::query_as::<_, FolderRow>("SELECT id, name, parent_id, created_at, updated_at FROM folders WHERE id = ?")
+    sqlx::query_as::<_, FolderRow>("SELECT id, name, parent_id, created_at, updated_at, password_hash FROM folders WHERE id = ?")
         .bind(id).fetch_optional(pool).await
 }
 
@@ -327,23 +347,34 @@ pub struct FolderWithMeta {
     pub cover_id: Option<String>,
     pub cover_media_type: Option<String>,
     pub item_count: i64,
+    pub has_password: bool,
 }
 
 pub async fn list_folders_with_meta(
     pool: &SqlitePool,
     parent_id: Option<&str>,
 ) -> Result<Vec<FolderWithMeta>, sqlx::Error> {
+    // cover 的两个子查询都加 `, m.id DESC` 兜底 tie-break：否则两条媒体 taken_at 相同时，
+    // SQLite 可能给 cover_id 和 cover_media_type 各选一行 → 图片 id 配上 video 类型（客户端图标/查看器错乱）。
+    // tree CTE 用 UNION 而非 UNION ALL：脏数据造成 parent 互指成环时，UNION 去重能让递归自然终止，
+    // 不会 "recursive query aborted" 直接 500。
     let sql = "
         SELECT
-            f.id, f.name, f.parent_id, f.created_at, f.updated_at,
+            f.id, f.name, f.parent_id, f.created_at, f.updated_at, f.password_hash,
             (SELECT m.id FROM media m
                 WHERE m.folder_id = f.id AND m.deleted_at IS NULL AND m.has_thumb = 1
-                ORDER BY COALESCE(m.taken_at, m.created_at) DESC LIMIT 1) AS cover_id,
+                ORDER BY COALESCE(m.taken_at, m.created_at) DESC, m.id DESC LIMIT 1) AS cover_id,
             (SELECT m.media_type FROM media m
                 WHERE m.folder_id = f.id AND m.deleted_at IS NULL AND m.has_thumb = 1
-                ORDER BY COALESCE(m.taken_at, m.created_at) DESC LIMIT 1) AS cover_media_type,
-            (SELECT COUNT(*) FROM media m
-                WHERE m.folder_id = f.id AND m.deleted_at IS NULL) AS item_count
+                ORDER BY COALESCE(m.taken_at, m.created_at) DESC, m.id DESC LIMIT 1) AS cover_media_type,
+            (SELECT COUNT(*) FROM media m WHERE m.deleted_at IS NULL AND m.folder_id IN (
+                WITH RECURSIVE tree(fid) AS (
+                    VALUES(f.id)
+                    UNION
+                    SELECT c.id FROM folders c JOIN tree ON c.parent_id = tree.fid
+                )
+                SELECT fid FROM tree
+            )) AS item_count
         FROM folders f
         WHERE ";
     let where_clause = if parent_id.is_some() { "f.parent_id = ?" } else { "f.parent_id IS NULL" };
@@ -354,17 +385,22 @@ pub async fn list_folders_with_meta(
     if let Some(pid) = parent_id { q = q.bind(pid); }
 
     let rows = q.fetch_all(pool).await?;
-    Ok(rows.into_iter().map(|row| FolderWithMeta {
-        row: FolderRow {
-            id: row.get("id"),
-            name: row.get("name"),
-            parent_id: row.get("parent_id"),
-            created_at: row.get("created_at"),
-            updated_at: row.get("updated_at"),
-        },
-        cover_id: row.get("cover_id"),
-        cover_media_type: row.get("cover_media_type"),
-        item_count: row.get("item_count"),
+    Ok(rows.into_iter().map(|row| {
+        let pw: Option<String> = row.get("password_hash");
+        FolderWithMeta {
+            has_password: pw.is_some(),
+            row: FolderRow {
+                id: row.get("id"),
+                name: row.get("name"),
+                parent_id: row.get("parent_id"),
+                created_at: row.get("created_at"),
+                updated_at: row.get("updated_at"),
+                password_hash: pw,
+            },
+            cover_id: row.get("cover_id"),
+            cover_media_type: row.get("cover_media_type"),
+            item_count: row.get("item_count"),
+        }
     }).collect())
 }
 
@@ -397,22 +433,64 @@ pub async fn is_descendant_of(pool: &SqlitePool, folder_id: &str, ancestor_id: &
     Ok(false)
 }
 
-pub async fn delete_folder(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
-    let r = sqlx::query("DELETE FROM folders WHERE id = ?")
-        .bind(id).execute(pool).await?;
+/// 递归删除文件夹：子树内所有媒体逻辑删除（进回收站，文件由 purge 周期清理），
+/// 子树内所有文件夹行物理删除。单事务，返回被逻辑删除的媒体数。
+pub async fn delete_folder_tree(pool: &SqlitePool, id: &str) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "WITH RECURSIVE tree(fid) AS (
+            VALUES(?)
+            UNION
+            SELECT c.id FROM folders c JOIN tree ON c.parent_id = tree.fid
+        ) SELECT fid FROM tree",
+    )
+    .bind(id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let ids: Vec<String> = rows.into_iter().map(|r| r.0).collect();
+
+    let now = now_rfc3339();
+    let mut media_deleted = 0u64;
+    for chunk in ids.chunks(500) {
+        let placeholders = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "UPDATE media SET deleted_at = ?, updated_at = ? \
+             WHERE deleted_at IS NULL AND folder_id IN ({placeholders})"
+        );
+        let mut q = sqlx::query(&sql).bind(&now).bind(&now);
+        for fid in chunk { q = q.bind(fid); }
+        media_deleted += q.execute(&mut *tx).await?.rows_affected();
+    }
+    for chunk in ids.chunks(500) {
+        let placeholders = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+        let sql = format!("DELETE FROM folders WHERE id IN ({placeholders})");
+        let mut q = sqlx::query(&sql);
+        for fid in chunk { q = q.bind(fid); }
+        q.execute(&mut *tx).await?;
+    }
+
+    tx.commit().await?;
+    Ok(media_deleted)
+}
+
+pub async fn set_folder_password(pool: &SqlitePool, id: &str, hash: Option<&str>) -> Result<bool, sqlx::Error> {
+    let now = now_rfc3339();
+    let r = sqlx::query("UPDATE folders SET password_hash = ?, updated_at = ? WHERE id = ?")
+        .bind(hash).bind(&now).bind(id).execute(pool).await?;
     Ok(r.rows_affected() > 0)
 }
 
-pub async fn folder_has_children(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
-    let n: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM folders WHERE parent_id = ?")
-        .bind(id).fetch_one(pool).await?;
-    Ok(n.0 > 0)
+pub async fn get_folder_password_hash(pool: &SqlitePool, id: &str) -> Result<Option<String>, sqlx::Error> {
+    let row: Option<(Option<String>,)> = sqlx::query_as("SELECT password_hash FROM folders WHERE id = ?")
+        .bind(id).fetch_optional(pool).await?;
+    Ok(row.and_then(|r| r.0))
 }
 
-pub async fn folder_has_media(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
-    let n: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM media WHERE folder_id = ? AND deleted_at IS NULL")
-        .bind(id).fetch_one(pool).await?;
-    Ok(n.0 > 0)
+pub async fn list_all_folders(pool: &SqlitePool) -> Result<Vec<FolderRow>, sqlx::Error> {
+    sqlx::query_as::<_, FolderRow>(
+        "SELECT id, name, parent_id, created_at, updated_at, password_hash FROM folders ORDER BY name ASC"
+    ).fetch_all(pool).await
 }
 
 /// batch move (R3)
@@ -467,18 +545,24 @@ pub async fn select_purgeable(
     .await
 }
 
-/// 物理删除到期条目（只删仍处于已删除状态的，避免误删刚 restore 的）
-pub async fn purge_ids(pool: &SqlitePool, rows: &[(String, String)]) -> Result<u64, sqlx::Error> {
-    if rows.is_empty() { return Ok(0); }
-    let mut total = 0u64;
+/// 物理删除到期条目（只删仍处于已删除状态的，避免误删刚 restore 的）。
+/// 返回**真正被删掉**的 (id, ext) —— purge_loop 必须只删这些的文件：
+/// select→delete 之间若某条被 restore，DELETE 的 `deleted_at IS NOT NULL` 守卫会跳过它，
+/// 用 RETURNING 拿回真实删除集，才不会把已恢复条目的文件误删（永久丢失）。
+pub async fn purge_ids(pool: &SqlitePool, rows: &[(String, String)]) -> Result<Vec<(String, String)>, sqlx::Error> {
+    if rows.is_empty() { return Ok(Vec::new()); }
+    let mut deleted: Vec<(String, String)> = Vec::new();
     for chunk in rows.chunks(500) {
         let placeholders = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
-        let sql = format!("DELETE FROM media WHERE deleted_at IS NOT NULL AND id IN ({placeholders})");
-        let mut q = sqlx::query(&sql);
+        let sql = format!(
+            "DELETE FROM media WHERE deleted_at IS NOT NULL AND id IN ({placeholders}) RETURNING id, ext"
+        );
+        let mut q = sqlx::query_as::<_, (String, String)>(&sql);
         for (id, _) in chunk { q = q.bind(id); }
-        total += q.execute(pool).await?.rows_affected();
+        let mut got = q.fetch_all(pool).await?;
+        deleted.append(&mut got);
     }
-    Ok(total)
+    Ok(deleted)
 }
 
 // ── flexible query with cursor pagination (R5) ──

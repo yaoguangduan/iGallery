@@ -8,13 +8,16 @@ import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:photo_view/photo_view.dart';
 import 'package:provider/provider.dart';
+import 'package:share_plus/share_plus.dart';
 
 import '../../core/api.dart';
 import '../../core/disk_cache.dart';
 import '../../core/display_prefs.dart';
 import '../../core/download_service.dart';
+import '../../core/hash_sync.dart';
 import '../../core/kv_store.dart';
 import '../../core/media_service.dart';
+import '../../core/platform.dart';
 import '../../core/time_fmt.dart';
 import '../../theme/app_theme.dart';
 import 'app_kit.dart';
@@ -39,15 +42,25 @@ class MediaViewer extends StatefulWidget {
   final MediaService service;
   final void Function(String id)? onDeleted;
   final VoidCallback onClose;
+  /// 移动端下载成功后"查看"→ 切到本地 tab。桌面端没有本地 tab，传 null。
+  final VoidCallback? onViewLocal;
+  /// 相册网格处于选择态时打开查看器：右上角显示选择圆圈、中间显示已选数量，
+  /// 隐藏收藏/分享/更多（此刻查看器的职责是"边看边选"，不是管理单张）。
+  final bool selecting;
+  final Set<String> selectedIds;
+  final ValueChanged<String>? onToggleSelect;
 
   const MediaViewer({super.key, required this.items, required this.initialIndex,
-    required this.service, required this.onClose, this.onDeleted});
+    required this.service, required this.onClose, this.onDeleted,
+    this.onViewLocal, this.selecting = false, this.selectedIds = const {},
+    this.onToggleSelect});
 
   @override
   State<MediaViewer> createState() => _MediaViewerState();
 }
 
-class _MediaViewerState extends State<MediaViewer> with TickerProviderStateMixin {
+class _MediaViewerState extends State<MediaViewer>
+    with TickerProviderStateMixin, WidgetsBindingObserver {
   late final PageController _pageCtrl;
   late final AnimationController _enterCtrl;
   late int _current;
@@ -68,11 +81,16 @@ class _MediaViewerState extends State<MediaViewer> with TickerProviderStateMixin
   double _scale = 1.0;
   double _baseScale = 1.0; // contained scale (fit-to-view)
 
+  // 选择态本地副本：查看器自己持有，切换时经 onToggleSelect 同步回相册网格
+  late final Set<String> _selected;
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _current = widget.initialIndex;
     _showDetails = widget.items[_current].isImage;
+    _selected = Set<String>.from(widget.selectedIds);
     _pageCtrl = PageController(initialPage: _current);
     _enterCtrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 300));
     _enterCtrl.forward();
@@ -81,7 +99,29 @@ class _MediaViewerState extends State<MediaViewer> with TickerProviderStateMixin
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // 退到后台/锁屏就暂停视频：media_kit 在 Android 不会自动停，
+    // 否则看不见画面了声音还在放。回到前台不自动续播（避免突兀），用户自己点。
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.hidden) {
+      _player?.pause();
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant MediaViewer old) {
+    super.didUpdateWidget(old);
+    // 防御：items 被上层删短后 _current 可能越界，夹回合法范围，避免 build 时 RangeError
+    if (widget.items.isNotEmpty && _current >= widget.items.length) {
+      _current = widget.items.length - 1;
+      _initVideo();
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _pageCtrl.dispose();
     _enterCtrl.dispose();
     _videoErrSub?.cancel();
@@ -93,6 +133,20 @@ class _MediaViewerState extends State<MediaViewer> with TickerProviderStateMixin
 
   MediaItem get _item => widget.items[_current];
   bool get _isImage => _item.isImage;
+  bool get _isCurSelected => _selected.contains(_item.id);
+
+  /// 选择态下切换当前项选中，并同步回相册网格（底部操作条随之更新）
+  void _toggleSelectCurrent() {
+    final id = _item.id;
+    setState(() {
+      if (_selected.contains(id)) {
+        _selected.remove(id);
+      } else {
+        _selected.add(id);
+      }
+    });
+    widget.onToggleSelect?.call(id);
+  }
 
   void _resetPhotoCtrl() {
     _photoCtrl?.dispose();
@@ -221,10 +275,13 @@ class _MediaViewerState extends State<MediaViewer> with TickerProviderStateMixin
     }
     if (!mounted) return;
     showToast(context, '已删除 $name', kind: ToastKind.success);
+    HashSync.instance.syncFromServer();
+    // 移除交给上层 onDeleted：它从共享列表(shell 的 _viewerItems / 桌面的 _viewerSnapshot)
+    // 摘掉该项，列表空了顺带关掉查看器。旧写法在这里既 removeWhere 又用 length<=1 判断，
+    // 会在还剩 1 张时误关查看器（本该显示幸存的那张）。
     widget.onDeleted?.call(id);
-    if (widget.items.length <= 1) { _close(); return; }
+    if (!mounted || widget.items.isEmpty) return;
     setState(() {
-      widget.items.removeWhere((m) => m.id == id);
       if (_current >= widget.items.length) _current = widget.items.length - 1;
       _initVideo();
     });
@@ -271,11 +328,42 @@ class _MediaViewerState extends State<MediaViewer> with TickerProviderStateMixin
       if (!mounted) return;
       if (savePath == null) return; // 用户取消
       final name = savePath.split(Platform.pathSeparator).last;
-      showToast(context, '已下载 $name', kind: ToastKind.success);
+      final viewLocal = widget.onViewLocal;
+      showToast(
+        context,
+        isMobile ? '已保存到系统相册 iGallery' : '已下载 $name',
+        kind: ToastKind.success,
+        actionLabel: isMobile && viewLocal != null ? '查看' : null,
+        onAction: isMobile && viewLocal != null ? viewLocal : null,
+      );
     } on ApiException catch (e) {
       if (mounted) showToast(context, '下载失败: ${e.displayMessage}', kind: ToastKind.error);
     } catch (_) {
       if (mounted) showToast(context, '下载失败', kind: ToastKind.error);
+    }
+  }
+
+  Future<void> _shareCurrent() async {
+    final item = _item;
+    try {
+      var file = DiskCache.instance.cachedMediaSync(item.id);
+      file ??= await DiskCache.instance.getMedia(
+        item.id,
+        widget.service.fullUrl(item.id),
+        widget.service.authHeaders,
+        isVideo: item.isVideo,
+        knownSize: item.size,
+      );
+      if (file == null || !mounted) {
+        if (mounted) showToast(context, '无法获取文件', kind: ToastKind.error);
+        return;
+      }
+      final mime = item.isVideo ? 'video/*' : 'image/*';
+      await Share.shareXFiles(
+        [XFile(file.path, mimeType: mime)],
+      );
+    } catch (e) {
+      if (mounted) showToast(context, '分享失败: $e', kind: ToastKind.error);
     }
   }
 
@@ -413,6 +501,10 @@ class _MediaViewerState extends State<MediaViewer> with TickerProviderStateMixin
                     }
                     if (_videoCtrl != null && _player != null) {
                       return _VideoView(
+                        // 按 item.id key 化：删除当前视频后 _initVideo 会换新 Player，
+                        // key 变→整棵控件子树重建→各控件 State 重新订阅新 player。
+                        // 否则控件仍订阅已 dispose 的旧 player，播放/进度/倍速全冻住、seek 到错位。
+                        key: ValueKey(item.id),
                         player: _player!,
                         controller: _videoCtrl!,
                         visible: _showUI,
@@ -421,6 +513,28 @@ class _MediaViewerState extends State<MediaViewer> with TickerProviderStateMixin
                         },
                       );
                     }
+                  }
+                  // 非当前页的视频：只放缩略图占位，绝不要把整个视频文件喂给 PhotoView/NetworkImage
+                  // 当图片解码——那会把整条视频拉进内存（broken_image 闪烁 + 带宽/内存尖峰，
+                  // 服务端日志里刷 "Invalid image data"）。成为当前页时 onPageChanged 再切真视频。
+                  if (item.isVideo) {
+                    return GestureDetector(
+                      onTap: () => setState(() => _showUI = !_showUI),
+                      child: ColoredBox(
+                        color: Colors.black,
+                        child: Center(
+                          child: Image.network(
+                            widget.service.thumbUrl(item.id),
+                            headers: widget.service.authHeaders,
+                            fit: BoxFit.contain,
+                            gaplessPlayback: true,
+                            errorBuilder: (_, __, ___) => const Icon(
+                                Icons.play_circle_outline,
+                                color: Colors.white24, size: 64),
+                          ),
+                        ),
+                      ),
+                    );
                   }
                   // 非图片非视频（音频/其它文件）：没法预览，明说并给下载入口，
                   // 别让 PhotoView 去拉它然后只剩一个碎图标
@@ -479,51 +593,85 @@ class _MediaViewerState extends State<MediaViewer> with TickerProviderStateMixin
                 child: Row(children: [
                   _IcoBtn(Icons.close, onTap: _close, tooltip: '关闭'),
                   const SizedBox(width: 4),
-                  Expanded(child: Text(_item.filename, maxLines: 1, overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(color: Colors.white70, fontSize: 12))),
-                  const SizedBox(width: 4),
-                  if (_isImage)
+                  if (widget.selecting) ...[
+                    // 选择态：中间显示已选数量，右上角是选择圆圈（可切换当前项）
+                    Expanded(child: Center(child: Text(
+                      '已选 ${_selected.length}',
+                      style: const TextStyle(color: Colors.white, fontSize: 13,
+                          fontWeight: FontWeight.w600)))),
+                    const SizedBox(width: 4),
                     GestureDetector(
-                      onTap: _cycleZoom,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                        decoration: BoxDecoration(color: Colors.white12, borderRadius: BorderRadius.circular(4)),
-                        child: Text('$_zoomPercent%',
-                            style: const TextStyle(color: Colors.white70, fontSize: 11, fontWeight: FontWeight.w600)),
+                      behavior: HitTestBehavior.opaque,
+                      onTap: _toggleSelectCurrent,
+                      child: Padding(
+                        padding: const EdgeInsets.all(8),
+                        child: Container(
+                          width: 26, height: 26,
+                          decoration: BoxDecoration(
+                            // 选中=蓝色（与网格/本地选择态一致）；深色底上用提亮的 _kViewerAccent
+                            color: _isCurSelected
+                                ? _kViewerAccent
+                                : Colors.white.withValues(alpha: 0.12),
+                            shape: BoxShape.circle,
+                            border: Border.all(
+                              color: _isCurSelected ? _kViewerAccent : Colors.white,
+                              width: 2,
+                            ),
+                          ),
+                          child: _isCurSelected
+                              ? const Icon(Icons.check, size: 16, color: Colors.white)
+                              : null,
+                        ),
                       ),
                     ),
-                  _IcoBtn(
-                    _item.isFavorite ? Icons.favorite : Icons.favorite_border,
-                    onTap: _toggleFavorite,
-                    color: _item.isFavorite ? _kViewerFav : null,
-                    tooltip: _item.isFavorite ? '取消收藏' : '收藏'),
-                  PopupMenuButton<String>(
-                    icon: const Icon(Icons.more_vert, color: Colors.white70, size: 20),
-                    color: Colors.grey[900],
-                    onSelected: (v) {
-                      switch (v) {
-                        case 'download': _downloadCurrent();
-                        case 'rename': _rename();
-                        case 'details': _toggleDetails();
-                        case 'delete': _delete();
-                      }
-                    },
-                    itemBuilder: (_) => [
-                      const PopupMenuItem(value: 'download', child: _MenuRow(Icons.file_download_outlined, '下载')),
-                      const PopupMenuItem(value: 'rename', child: _MenuRow(Icons.edit_outlined, '重命名')),
-                      PopupMenuItem(value: 'details', child: _MenuRow(
-                        _showDetails ? Icons.info : Icons.info_outline,
-                        _showDetails ? '隐藏详情' : '查看详情',
-                      )),
-                      const PopupMenuItem(value: 'delete', child: _MenuRow(Icons.delete_outline, '删除', danger: true)),
-                    ],
-                  ),
+                  ] else ...[
+                    Expanded(child: Text(_item.filename, maxLines: 1, overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(color: Colors.white70, fontSize: 12))),
+                    const SizedBox(width: 4),
+                    if (_isImage)
+                      GestureDetector(
+                        onTap: _cycleZoom,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                          decoration: BoxDecoration(color: Colors.white12, borderRadius: BorderRadius.circular(4)),
+                          child: Text('$_zoomPercent%',
+                              style: const TextStyle(color: Colors.white70, fontSize: 11, fontWeight: FontWeight.w600)),
+                        ),
+                      ),
+                    _IcoBtn(
+                      _item.isFavorite ? Icons.favorite : Icons.favorite_border,
+                      onTap: _toggleFavorite,
+                      color: _item.isFavorite ? _kViewerFav : null,
+                      tooltip: _item.isFavorite ? '取消收藏' : '收藏'),
+                    _IcoBtn(Icons.share, onTap: _shareCurrent, tooltip: '分享'),
+                    PopupMenuButton<String>(
+                      icon: const Icon(Icons.more_vert, color: Colors.white70, size: 20),
+                      color: Colors.grey[900],
+                      onSelected: (v) {
+                        switch (v) {
+                          case 'download': _downloadCurrent();
+                          case 'rename': _rename();
+                          case 'details': _toggleDetails();
+                          case 'delete': _delete();
+                        }
+                      },
+                      itemBuilder: (_) => [
+                        const PopupMenuItem(value: 'download', child: _MenuRow(Icons.file_download_outlined, '下载')),
+                        const PopupMenuItem(value: 'rename', child: _MenuRow(Icons.edit_outlined, '重命名')),
+                        PopupMenuItem(value: 'details', child: _MenuRow(
+                          _showDetails ? Icons.info : Icons.info_outline,
+                          _showDetails ? '隐藏详情' : '查看详情',
+                        )),
+                        const PopupMenuItem(value: 'delete', child: _MenuRow(Icons.delete_outline, '删除', danger: true)),
+                      ],
+                    ),
+                  ],
                 ]),
               ),
             )),
 
-          // 底部详情（视频时暂停播放后显示）
-          if (_showUI && _showDetails)
+          // 底部详情（视频时暂停播放后显示）；选择态下隐藏，专注"边看边选"
+          if (_showUI && _showDetails && !widget.selecting)
             Positioned(bottom: 0, left: 0, right: 0, child: AnimatedOpacity(
               opacity: 1.0, duration: const Duration(milliseconds: 150),
               child: Container(
@@ -717,6 +865,7 @@ class _VideoView extends StatelessWidget {
   final bool visible;
   final ValueChanged<bool> onVisibleChanged;
   const _VideoView({
+    super.key,
     required this.player,
     required this.controller,
     required this.visible,

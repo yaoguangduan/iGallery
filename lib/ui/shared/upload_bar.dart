@@ -63,6 +63,8 @@ class _UploadBarState extends State<UploadBar> {
       if (m.lastError != null) left += ' · ${m.lastError}';
     } else if (m.cancelling) {
       left = '正在取消… ${m.completed}/${m.total}';
+    } else if (m.retrying) {
+      left = '网络断开，重试中… ${m.completed}/${m.total}';
     } else {
       final name = m.currentFilename;
       final short = name.length > 12 ? '${name.substring(0, 12)}…' : name;
@@ -70,8 +72,10 @@ class _UploadBarState extends State<UploadBar> {
     }
 
     final rightParts = <String>[
-      if (!done && !m.cancelling && speed > 0) '${_fmtBytes(speed)}/s',
-      if (!done && !m.cancelling && eta != null) 'ETA ${_fmtEta(eta)}',
+      if (!done && !m.cancelling && !m.retrying && speed > 0)
+        '${_fmtBytes(speed)}/s',
+      if (!done && !m.cancelling && !m.retrying && eta != null)
+        'ETA ${_fmtEta(eta)}',
     ];
     final right = rightParts.join(' · ');
 
@@ -90,7 +94,11 @@ class _UploadBarState extends State<UploadBar> {
                 minHeight: 2,
                 backgroundColor: c.outline,
                 valueColor: AlwaysStoppedAnimation(
-                  hasIssue && !m.uploading ? c.warn : c.brand),
+                  hasIssue && !m.uploading
+                      ? c.warn
+                      : m.retrying
+                          ? c.onMuted
+                          : c.brand),
               ),
             ),
             Padding(

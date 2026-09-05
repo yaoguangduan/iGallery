@@ -166,14 +166,18 @@ echo "==> iGallery $VERSION"
 
 if [ -n "$do_server" ]; then
   echo "==> Cross-compiling server ($MUSL_TARGET) ..."
-  cd server && cargo build --release --target "$MUSL_TARGET" && cd ..
+  # 子 shell 里 cd：构建失败时 set -e 立刻中止，且父 shell 仍停在仓库根，
+  # 不会像 `cd server && cargo && cd ..` 那样——cargo 失败时 cd .. 被跳过、
+  # 中途命令又被 set -e 豁免，脚本留在 server/ 里继续跑，把后面所有相对路径
+  # （du/pubspec/grep）全带歪。
+  ( cd server && cargo build --release --target "$MUSL_TARGET" )
   echo "    $SRV_NAME ($(du -h "$SRV_BUILT" | cut -f1))"
 fi
 
 if [ -n "$do_apk" ]; then
   bump_version
   echo "==> Building release APK ..."
-  cd client && flutter build apk --release && cd ..
+  ( cd client && flutter build apk --release )
   echo "    $APK_NAME ($(du -h "$APK_BUILT" | cut -f1))"
   # After the build, so a version that never produced an APK never reaches history.
   commit_version
@@ -251,11 +255,29 @@ cd "$SVR_DIR" 2>/dev/null || {
   exit 1
 }
 
-# Match on the bare name, not "$SVR_DIR/$SVR_BIN": the instance running right now
-# may have been started by hand from another directory, and a second server bound
-# to the same port would just fail to bind and leave the old code serving.
+# Kill by process name first, then ensure the port is free.
+# A plain pkill + sleep 1 left a race where the old process hadn't released the
+# socket yet, so the new server got EADDRINUSE and never came up.
 pkill -f "$SVR_BIN" 2>/dev/null || true
-sleep 1
+
+# Also kill anything else squatting on the port (e.g. a manually started instance).
+PORT_PID=$(lsof -ti :"$SVR_PORT" 2>/dev/null || true)
+if [ -n "$PORT_PID" ]; then
+  kill $PORT_PID 2>/dev/null || true
+fi
+
+# Wait up to 5 seconds for the port to actually be freed.
+for i in 1 2 3 4 5; do
+  if ! lsof -ti :"$SVR_PORT" >/dev/null 2>&1; then break; fi
+  sleep 1
+done
+
+# Last resort: if still occupied, force kill.
+PORT_PID=$(lsof -ti :"$SVR_PORT" 2>/dev/null || true)
+if [ -n "$PORT_PID" ]; then
+  kill -9 $PORT_PID 2>/dev/null || true
+  sleep 1
+fi
 
 # DATA_DIR is under $SVR_DIR, so the SQLite db, media/ and thumbs/ outlive every
 # release — the binary is the only thing a deploy replaces. A first run here

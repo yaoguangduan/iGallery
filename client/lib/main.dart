@@ -44,7 +44,9 @@ Future<void> main() async {
     // 上次进程被杀时遗留的 "进行中" 记录标成中断，
     // 否则用户会一直看到永远转圈的假记录
     await UploadHistory.markStalePending();
-    await HashSync.instance.loadLocal();
+    // loadLocal 改由 server_state.connect() 在 baseUrl 确定后触发；
+    // 在这里调时 apiConfig.baseUrl 还是 null，只会空转（serverKey 拿不到）。
+    unawaited(HashSync.instance.warmAssetCache());
 
     final displayPrefs = DisplayPrefs();
     await displayPrefs.load();

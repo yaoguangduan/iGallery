@@ -75,7 +75,7 @@ class MediaThumb extends StatelessWidget {
         prefs.labelPosition == LabelPosition.overlay &&
         tileWidth >= _labelMinTileWidth;
     final compact = tileWidth < _labelMinTileWidth;
-    return GestureDetector(
+    return QuickLongPress(
       onTap: onTap, onLongPress: onLongPress,
       onSecondaryTapDown: onSecondaryTap == null
           ? null
@@ -169,8 +169,10 @@ class MediaThumb extends StatelessWidget {
   Widget _label(Color primary, Color secondary) {
     final parts = <Widget>[];
     final ts = TextStyle(color: secondary, fontSize: AppType.xxs);
-    if (prefs.showName) parts.add(Text(item.filename, maxLines: 1, overflow: TextOverflow.ellipsis,
+    if (prefs.showName) {
+      parts.add(Text(item.filename, maxLines: 1, overflow: TextOverflow.ellipsis,
         style: TextStyle(color: primary, fontSize: AppType.xs, fontWeight: FontWeight.w500)));
+    }
     if (prefs.showTime) {
       final text = fmtDateShort(item.displayDate);
       if (text.isNotEmpty) parts.add(Text(text, maxLines: 1, style: ts));

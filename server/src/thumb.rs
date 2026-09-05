@@ -70,6 +70,9 @@ pub fn generate_thumbnail(src: &Path, dst: &Path) -> Result<(), String> {
     thumb.save(dst).map_err(|e| format!("save thumbnail: {e}"))
 }
 
+// 曾经的 generate_blur_thumb（加密文件夹封面模糊图）已移除：
+// 马赛克改由客户端对普通缩略图渲染（LockedCover），服务端不再多存一份 _blur.jpg。
+
 pub struct VideoMeta {
     pub duration: Option<f64>,
     pub width: Option<u32>,
@@ -171,14 +174,20 @@ fn probe_mp4_native(src: &Path) -> Option<VideoMeta> {
     let mut height = None;
     // mp4parse 0.17 未暴露 creation_time；视频时间由 ffprobe 兜底
 
-    if let Some(ref ts) = ctx.timescale {
-        for track in &ctx.tracks {
-            if track.track_type == mp4parse::TrackType::Video {
-                if let Some(d) = track.duration {
-                    duration = Some(d.0 as f64 / ts.0 as f64);
+    // track.duration 是按该 track 自己的 mdhd 时基计数的(TrackScaledTime)，
+    // 必须除以 track.timescale，而不是 ctx.timescale(mvhd 全局时基)。两者不同
+    // (常见 mdhd=90000 / mvhd=1000)时旧写法会算出 90× 的离谱时长，而且 duration
+    // 一旦是 Some，下面的 ffprobe 兜底就不再纠正它。
+    for track in &ctx.tracks {
+        if track.track_type == mp4parse::TrackType::Video {
+            if let Some(ref d) = track.duration {
+                if let Some(ref ts) = track.timescale {
+                    if ts.0 > 0 {
+                        duration = Some(d.0 as f64 / ts.0 as f64);
+                    }
                 }
-                break;
             }
+            break;
         }
     }
     for track in &ctx.tracks {

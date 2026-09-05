@@ -5,8 +5,10 @@ import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 
 import 'api.dart';
+import 'download_service.dart';
 import 'hash_sync.dart';
 import 'mime.dart';
+import 'platform.dart';
 import 'server_state.dart';
 import 'time_fmt.dart';
 
@@ -175,6 +177,7 @@ class FolderItem {
   final String? coverId;
   final String? coverMediaType;
   final int itemCount;
+  final bool hasPassword;
   final String createdAt;
   final String updatedAt;
 
@@ -185,19 +188,21 @@ class FolderItem {
     this.coverId,
     this.coverMediaType,
     required this.itemCount,
+    this.hasPassword = false,
     required this.createdAt,
     required this.updatedAt,
   });
 
   bool get coverIsVideo => coverMediaType == 'video';
 
-  FolderItem copyWith({String? name}) => FolderItem(
+  FolderItem copyWith({String? name, bool? hasPassword}) => FolderItem(
     id: id,
     name: name ?? this.name,
     parentId: parentId,
     coverId: coverId,
     coverMediaType: coverMediaType,
     itemCount: itemCount,
+    hasPassword: hasPassword ?? this.hasPassword,
     createdAt: createdAt,
     updatedAt: updatedAt,
   );
@@ -209,6 +214,7 @@ class FolderItem {
     coverId: j['cover_id'] as String?,
     coverMediaType: j['cover_media_type'] as String?,
     itemCount: (j['item_count'] as num?)?.toInt() ?? 0,
+    hasPassword: j['has_password'] == true,
     createdAt: j['created_at'] as String,
     updatedAt: j['updated_at'] as String? ?? '',
   );
@@ -334,13 +340,9 @@ class MediaService {
     final response = await Api.instance.client.send(request);
     final body = await response.stream.bytesToString();
     if (response.statusCode != 200) {
-      throw ApiException(
-        response.statusCode == 401
-            ? ApiErrorKind.unauthorized
-            : ApiErrorKind.server,
-        'upload ${response.statusCode}',
-        statusCode: response.statusCode,
-      );
+      // 走 Api 统一错误层：分类正确(401/403→unauthorized)、触发 needAuth 钩子、
+      // 用服务端 body 里的人话而不是裸 "upload 401"。
+      throw Api.instance.errorFromResponse(response.statusCode, body);
     }
     final json = jsonDecode(body);
     // new response format: {items: [...], errors: [...]}
@@ -383,42 +385,6 @@ class MediaService {
       onSent?.call(sent);
       yield chunk;
     }
-  }
-
-  Future<UploadResult?> uploadBytes({
-    required Uint8List bytes,
-    required String filename,
-    String? takenAt,
-    String? folderId,
-  }) async {
-    final request = http.MultipartRequest(
-      'POST',
-      Uri.parse('$_base/v1/media/upload'),
-    );
-    request.headers.addAll(authHeaders);
-    request.files.add(
-      http.MultipartFile.fromBytes(
-        'file',
-        bytes,
-        filename: filename,
-        contentType: guessMime(filename),
-      ),
-    );
-    if (takenAt != null) request.fields['taken_at'] = takenAt;
-    if (folderId != null) request.fields['folder_id'] = folderId;
-    final response = await request.send();
-    final body = await response.stream.bytesToString();
-    if (response.statusCode != 200) {
-      throw ApiException(
-        ApiErrorKind.server,
-        'upload ${response.statusCode}',
-        statusCode: response.statusCode,
-      );
-    }
-    final list = jsonDecode(body) as List;
-    if (list.isEmpty) return null;
-    final j = list.first as Map<String, dynamic>;
-    return UploadResult(item: MediaItem.fromJson(j), dedup: j['dedup'] == true);
   }
 
   Future<Uint8List> downloadBytes(String id) async {
@@ -531,7 +497,25 @@ class MediaService {
               } catch (_) {}
             }
           }
-          ok++;
+          final saved =
+              await DownloadService.instance.saveToGallery(file, filename);
+          if (saved) {
+            ok++;
+            // 移动端 saveDir 是临时暂存目录，存进系统相册后删掉临时副本，
+            // 否则批量下载会把整份原图又攒在 temp 里塞满存储。
+            // 桌面端 saveDir 是用户选定的位置，文件就是要留在那儿，不删。
+            if (isMobile) {
+              try {
+                await file.delete();
+              } catch (_) {}
+            }
+          } else {
+            // 存系统相册失败（移动端）：删临时副本、如实计失败，不再谎报"已保存"
+            try {
+              await file.delete();
+            } catch (_) {}
+            failed++;
+          }
         } else {
           await resp.stream.drain();
           failed++;
@@ -586,6 +570,19 @@ class MediaService {
 
   Future<void> deleteFolder(String id) =>
       Api.instance.delete('/v1/folders/$id');
+
+  Future<void> setFolderPassword(String id, String? password) =>
+      Api.instance.patchJson('/v1/folders/$id', body: {'password': password ?? ''});
+
+  Future<bool> unlockFolder(String id, String password) async {
+    // 服务端用 {unlocked:false} 表达密码错误（不再用 401）—— 401 会触发全局鉴权钩子
+    // 清空服务器 token，把"文件夹密码错"误当成"token 失效"，之后输对的 PIN 也永远失败。
+    final result = await Api.instance.postJson(
+      '/v1/folders/$id/unlock',
+      body: {'password': password},
+    );
+    return result is Map && result['unlocked'] == true;
+  }
 
   Future<int> batchMove(List<String> ids, {String? folderId}) async {
     final json =

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
+import '../../core/time_fmt.dart';
 import '../../core/upload_history.dart';
 import '../../theme/app_theme.dart';
 import 'app_kit.dart';
@@ -55,15 +56,18 @@ class _UploadHistoryPageState extends State<UploadHistoryPage> {
     return '${(b / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
   }
 
-  String _fmtTime(DateTime t) => DateFormat('HH:mm:ss').format(t);
+  // 统一北京时间显示（§1/§4.3）：设备在 UTC+8 以外时，旧写法用本地时间会与
+  // 服务端、相册展示的时间对不上。
+  String _fmtTime(DateTime t) => DateFormat('HH:mm:ss').format(toBeijing(t)!);
 
   String _dateBucket(DateTime t) {
-    final now = DateTime.now();
-    final today = DateTime(now.year, now.month, now.day);
-    final d = DateTime(t.year, t.month, t.day);
+    final bj = toBeijing(t)!;
+    final nowBj = toBeijing(DateTime.now())!;
+    final today = DateTime(nowBj.year, nowBj.month, nowBj.day);
+    final d = DateTime(bj.year, bj.month, bj.day);
     if (d == today) return '今天';
     if (d == today.subtract(const Duration(days: 1))) return '昨天';
-    if (d.year == now.year) return '${d.month}月${d.day}日';
+    if (d.year == nowBj.year) return '${d.month}月${d.day}日';
     return '${d.year}年${d.month}月${d.day}日';
   }
 

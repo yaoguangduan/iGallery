@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/gestures.dart';
 
 import '../../theme/app_theme.dart';
 
@@ -50,7 +51,7 @@ class AppScrollbar extends StatelessWidget {
           return c.onSurfaceVariant.withValues(alpha: active ? 0.72 : 0.46);
         }),
         thickness: WidgetStateProperty.resolveWith((states) {
-          return states.contains(WidgetState.hovered) ? 8 : 7;
+          return states.contains(WidgetState.hovered) ? 10.0 : 9.0;
         }),
         radius: const Radius.circular(AppRadius.pill),
         crossAxisMargin: AppSpace.xs,
@@ -232,4 +233,44 @@ Future<bool> appConfirmDialog(
     ),
   );
   return result ?? false;
+}
+
+class QuickLongPress extends StatelessWidget {
+  static const Duration duration = Duration(milliseconds: 200);
+
+  final VoidCallback? onTap;
+  final VoidCallback? onLongPress;
+  final GestureTapDownCallback? onSecondaryTapDown;
+  final Widget child;
+
+  const QuickLongPress({
+    super.key,
+    this.onTap,
+    this.onLongPress,
+    this.onSecondaryTapDown,
+    required this.child,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return RawGestureDetector(
+      behavior: HitTestBehavior.opaque,
+      gestures: <Type, GestureRecognizerFactory>{
+        TapGestureRecognizer:
+            GestureRecognizerFactoryWithHandlers<TapGestureRecognizer>(
+          TapGestureRecognizer.new,
+          (r) {
+            r.onTap = onTap;
+            r.onSecondaryTapDown = onSecondaryTapDown;
+          },
+        ),
+        LongPressGestureRecognizer:
+            GestureRecognizerFactoryWithHandlers<LongPressGestureRecognizer>(
+          () => LongPressGestureRecognizer(duration: duration),
+          (r) => r.onLongPress = onLongPress,
+        ),
+      },
+      child: child,
+    );
+  }
 }

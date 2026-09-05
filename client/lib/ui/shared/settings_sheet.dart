@@ -1,3 +1,4 @@
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
@@ -777,50 +778,292 @@ class _SheetOptionTile extends StatelessWidget {
   }
 }
 
-Future<void> _pickDateRange(
+void _pickDateRange(
   BuildContext context,
   DisplayPrefs prefs,
   VoidCallback onChanged,
-) async {
-  final c = context.colors;
-  final now = DateTime.now();
-  final today = DateTime(now.year, now.month, now.day);
-  final initial = prefs.dateFrom != null && prefs.dateTo != null
-      ? DateTimeRange(start: prefs.dateFrom!, end: prefs.dateTo!)
-      : DateTimeRange(
-          start: today.subtract(const Duration(days: 29)),
-          end: today,
-        );
-  final range = await showDateRangePicker(
+) {
+  showModalBottomSheet<void>(
     context: context,
-    firstDate: DateTime(1970),
-    lastDate: today,
-    initialDateRange: initial,
-    initialEntryMode: DatePickerEntryMode.calendarOnly,
-    helpText: '选择拍摄日期范围',
-    saveText: '应用',
-    builder: (ctx, child) {
-      final base = Theme.of(ctx);
-      return Theme(
-        data: base.copyWith(
-          colorScheme: base.colorScheme.copyWith(
-            primary: c.brand,
-            surface: c.surface,
-            onSurface: c.onSurface,
-          ),
-        ),
-        child: Center(
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 480, maxHeight: 640),
-            child: child!,
-          ),
-        ),
-      );
-    },
+    isScrollControlled: true,
+    backgroundColor: Colors.transparent,
+    builder: (_) => _DateRangePickerSheet(prefs: prefs, onChanged: onChanged),
   );
-  if (range == null) return;
-  prefs.setDateRange(range.start, range.end);
-  onChanged();
+}
+
+class _DateRangePickerSheet extends StatefulWidget {
+  final DisplayPrefs prefs;
+  final VoidCallback onChanged;
+  const _DateRangePickerSheet({required this.prefs, required this.onChanged});
+
+  @override
+  State<_DateRangePickerSheet> createState() => _DateRangePickerSheetState();
+}
+
+class _DateRangePickerSheetState extends State<_DateRangePickerSheet> {
+  static const _presets = <(int, String)>[
+    (7, '7 天'),
+    (30, '30 天'),
+    (90, '3 个月'),
+    (180, '半年'),
+    (365, '1 年'),
+  ];
+
+  late DateTime _from;
+  late DateTime _to;
+  bool _pickingFrom = false;
+  bool _pickingTo = false;
+
+  @override
+  void initState() {
+    super.initState();
+    final now = DateTime.now();
+    _to = widget.prefs.dateTo ?? DateTime(now.year, now.month, now.day);
+    _from = widget.prefs.dateFrom ?? _to.subtract(const Duration(days: 29));
+  }
+
+  DateTime get _today {
+    final n = DateTime.now();
+    return DateTime(n.year, n.month, n.day);
+  }
+
+  int? _matchedPreset() {
+    final today = _today;
+    if (widget.prefs.dateFrom == null || widget.prefs.dateTo == null) return null;
+    final to = widget.prefs.dateTo!;
+    final from = widget.prefs.dateFrom!;
+    if (to.difference(today).inDays.abs() > 1) return null;
+    for (final (days, _) in _presets) {
+      final expected = today.subtract(Duration(days: days));
+      if ((from.difference(expected).inDays).abs() <= 1) return days;
+    }
+    return null;
+  }
+
+  void _applyPreset(int days) {
+    final today = _today;
+    widget.prefs.setDateRange(today.subtract(Duration(days: days)), today);
+    widget.onChanged();
+    Navigator.pop(context);
+  }
+
+  void _applyCustom() {
+    if (_from.isAfter(_to)) {
+      final tmp = _from;
+      _from = _to;
+      _to = tmp;
+    }
+    widget.prefs.setDateRange(_from, _to);
+    widget.onChanged();
+    Navigator.pop(context);
+  }
+
+  void _clearDate() {
+    widget.prefs.setDateRange(null, null);
+    widget.onChanged();
+    Navigator.pop(context);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.colors;
+    final matched = _matchedPreset();
+    final fmt = DateFormat('yyyy/MM/dd');
+    final hasDate = widget.prefs.dateFrom != null;
+
+    return Container(
+      decoration: BoxDecoration(
+        color: c.bg,
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(AppRadius.sheet)),
+      ),
+      child: SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            const SheetHandle(),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
+              child: Row(
+                children: [
+                  Text('选择日期范围', style: TextStyle(
+                    color: c.onSurface, fontSize: AppType.mdPlus,
+                    fontWeight: FontWeight.w700,
+                  )),
+                  const Spacer(),
+                  if (hasDate) TextButton(
+                    onPressed: _clearDate,
+                    child: Text('不限', style: TextStyle(color: c.brand)),
+                  ),
+                ],
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  for (final (days, label) in _presets)
+                    _PresetChip(
+                      label: label,
+                      selected: matched == days,
+                      brandColor: c.brand,
+                      onSurface: c.onSurface,
+                      outline: c.outline,
+                      onTap: () => _applyPreset(days),
+                    ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 16),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: Text('自定义范围', style: TextStyle(
+                color: c.onMuted, fontSize: AppType.xs, fontWeight: FontWeight.w600,
+              )),
+            ),
+            const SizedBox(height: 8),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: Row(
+                children: [
+                  Expanded(child: _DateButton(
+                    label: '起始',
+                    value: fmt.format(_from),
+                    active: _pickingFrom,
+                    c: c,
+                    onTap: () => setState(() {
+                      _pickingFrom = !_pickingFrom;
+                      _pickingTo = false;
+                    }),
+                  )),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    child: Text('—', style: TextStyle(color: c.onMuted)),
+                  ),
+                  Expanded(child: _DateButton(
+                    label: '截止',
+                    value: fmt.format(_to),
+                    active: _pickingTo,
+                    c: c,
+                    onTap: () => setState(() {
+                      _pickingTo = !_pickingTo;
+                      _pickingFrom = false;
+                    }),
+                  )),
+                ],
+              ),
+            ),
+            if (_pickingFrom || _pickingTo)
+              SizedBox(
+                height: 200,
+                child: CupertinoDatePicker(
+                  mode: CupertinoDatePickerMode.date,
+                  initialDateTime: _pickingFrom ? _from : _to,
+                  minimumDate: DateTime(1970),
+                  maximumDate: _today,
+                  onDateTimeChanged: (dt) {
+                    setState(() {
+                      if (_pickingFrom) {
+                        _from = dt;
+                      } else {
+                        _to = dt;
+                      }
+                    });
+                  },
+                ),
+              ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+              child: FilledButton(
+                onPressed: _applyCustom,
+                style: FilledButton.styleFrom(
+                  backgroundColor: c.brand,
+                  minimumSize: const Size.fromHeight(44),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(AppRadius.chip),
+                  ),
+                ),
+                child: const Text('应用'),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _PresetChip extends StatelessWidget {
+  final String label;
+  final bool selected;
+  final Color brandColor;
+  final Color onSurface;
+  final Color outline;
+  final VoidCallback onTap;
+  const _PresetChip({
+    required this.label, required this.selected,
+    required this.brandColor, required this.onSurface,
+    required this.outline, required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return OutlinedButton(
+      onPressed: onTap,
+      style: OutlinedButton.styleFrom(
+        foregroundColor: selected ? brandColor : onSurface,
+        side: BorderSide(color: selected ? brandColor : outline),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        minimumSize: Size.zero,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(AppRadius.pill),
+        ),
+      ),
+      child: Text(label, style: TextStyle(
+        fontSize: AppType.sm,
+        fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+      )),
+    );
+  }
+}
+
+class _DateButton extends StatelessWidget {
+  final String label;
+  final String value;
+  final bool active;
+  final AppColors c;
+  final VoidCallback onTap;
+  const _DateButton({
+    required this.label, required this.value,
+    required this.active, required this.c, required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        decoration: BoxDecoration(
+          border: Border.all(color: active ? c.brand : c.outline),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(label, style: TextStyle(color: c.onMuted, fontSize: AppType.xxs)),
+            const SizedBox(height: 2),
+            Text(value, style: TextStyle(
+              color: c.onSurface, fontSize: AppType.sm,
+              fontWeight: FontWeight.w500,
+            )),
+          ],
+        ),
+      ),
+    );
+  }
 }
 
 void _showOptions<T>(
@@ -887,8 +1130,23 @@ String _transitionLabel(ViewerTransition value) => switch (value) {
 
 String _dateFilterLabel(DisplayPrefs prefs) {
   if (prefs.dateFrom == null || prefs.dateTo == null) return '不限';
-  final format = DateFormat('yyyy/MM/dd');
-  return '${format.format(prefs.dateFrom!)} - ${format.format(prefs.dateTo!)}';
+  final now = DateTime.now();
+  final today = DateTime(now.year, now.month, now.day);
+  final to = prefs.dateTo!;
+  final from = prefs.dateFrom!;
+  if (to.difference(today).inDays.abs() <= 1) {
+    const presets = <(int, String)>[
+      (7, '最近 7 天'), (30, '最近 30 天'), (90, '最近 3 个月'),
+      (180, '最近半年'), (365, '最近 1 年'),
+    ];
+    for (final (days, label) in presets) {
+      if ((from.difference(today.subtract(Duration(days: days))).inDays).abs() <= 1) {
+        return label;
+      }
+    }
+  }
+  final fmt = DateFormat('yyyy/MM/dd');
+  return '${fmt.format(from)} - ${fmt.format(to)}';
 }
 
 /// 缓存清理入口（About 分组里）

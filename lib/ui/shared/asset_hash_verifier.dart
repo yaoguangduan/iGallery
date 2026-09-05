@@ -139,41 +139,16 @@ List<AssetEntity> visibleGridAssets({
   return assets.sublist(first, end);
 }
 
-/// 「已传」角标：半透明黑底 + 白色云朵图标 + 白色小字，整体紧凑。
-/// 之前是七彩祥云（缩略图上看形不清），改纯白后又要回云朵轮廓 —— 白色 cloud_done
-/// 既保留"云"的语义又清晰，配暗底在任意照片上都 readable（§2.1 图片上层遮罩体系）。
 class UploadedBadge extends StatelessWidget {
-  final double size;
-  const UploadedBadge({super.key, this.size = 18});
+  const UploadedBadge({super.key});
 
   @override
   Widget build(BuildContext context) {
-    final c = context.colors;
-    return Container(
-      padding: EdgeInsets.symmetric(
-        horizontal: size * 0.22,
-        vertical: size * 0.08,
-      ),
-      decoration: BoxDecoration(
-        color: c.scrimMedium,
-        borderRadius: BorderRadius.circular(4),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(Icons.cloud_done, color: c.onScrim, size: size * 0.78),
-          SizedBox(width: size * 0.12),
-          Text(
-            '已传',
-            style: TextStyle(
-              color: c.onScrim,
-              fontSize: size * 0.55,
-              fontWeight: FontWeight.w600,
-              height: 1.0,
-            ),
-          ),
-        ],
-      ),
+    return const Icon(
+      Icons.cloud_done_rounded,
+      size: 18,
+      color: Color(0xFF4CAF50),
+      shadows: [Shadow(color: Colors.black54, blurRadius: 3)],
     );
   }
 }

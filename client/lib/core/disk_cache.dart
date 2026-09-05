@@ -121,6 +121,9 @@ class DiskCache {
       req.headers.addAll(headers);
       final resp = await Api.instance.client.send(req);
       if (resp.statusCode != 200) {
+        // 非 200 也要 drain：否则这条连接的响应体没被消费，keep-alive socket 无法复用/释放
+        // （例如缩略图对应的媒体已在服务端删除、网格里还是旧数据时命中 404）。
+        await resp.stream.drain();
         completer.complete(null);
         return null;
       }

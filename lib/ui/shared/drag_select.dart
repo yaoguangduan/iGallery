@@ -213,11 +213,11 @@ class _DragSelectDetectorState extends State<DragSelectDetector> {
                   r.onCancel = _finish;
                 },
               ),
-              // 路径 2：按住 160ms 再拖，方向不限
+              // 路径 2：按住 120ms 再拖，方向不限
               DelayedMultiDragGestureRecognizer:
                   GestureRecognizerFactoryWithHandlers<DelayedMultiDragGestureRecognizer>(
                 () => DelayedMultiDragGestureRecognizer(
-                  delay: const Duration(milliseconds: 160),
+                  delay: const Duration(milliseconds: 120),
                 ),
                 (r) => r.onStart = _onDelayedDragStart,
               ),

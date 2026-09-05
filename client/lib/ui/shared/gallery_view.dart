@@ -37,6 +37,9 @@ abstract class GalleryShellHost {
     required int index,
     required MediaService service,
     void Function(String)? onDeleted,
+    bool selecting = false,
+    Set<String> selectedIds = const {},
+    ValueChanged<String>? onToggleSelect,
   });
   void updateSelection({
     required int sourceTab,
@@ -53,8 +56,11 @@ abstract class GalleryShellHost {
     VoidCallback? onUpload,
     VoidCallback? onExitSelection,
   });
+  void updateFolderDepth(int depth, {VoidCallback? onGoBack});
   void pickAndUpload({String? folderId});
   void switchToTab(int index);
+  /// 下载成功后"查看"：收起可能浮着的查看器 + 切到本地 tab（会强制全量刷新）。
+  void showLocalDownloads();
 }
 
 bool get _isDesktop => isDesktop;
@@ -88,6 +94,25 @@ class _GalleryViewState extends State<GalleryView>
   bool _selecting = false;
   final Set<String> _selected = {};
 
+  /// 已解锁的加密文件夹 → 解锁到期时刻。
+  /// 解锁状态只留在内存且有时效：过期再进就得重新输密码，
+  /// 不然别人拿起手机能一直看加密文件夹。
+  static const Duration _unlockTtl = Duration(minutes: 5);
+  final Map<String, DateTime> _unlockedUntil = {};
+
+  bool _isUnlocked(String folderId) {
+    final until = _unlockedUntil[folderId];
+    if (until == null) return false;
+    if (DateTime.now().isAfter(until)) {
+      _unlockedUntil.remove(folderId);
+      return false;
+    }
+    return true;
+  }
+
+  void _markUnlocked(String folderId) =>
+      _unlockedUntil[folderId] = DateTime.now().add(_unlockTtl);
+
   // 滑选（多选模式下按住拖动）
   int? _sweepAnchor;
   bool _sweepAdding = true;
@@ -102,11 +127,14 @@ class _GalleryViewState extends State<GalleryView>
   int _downloadTotal = 0;
 
   int? _viewerIndex;
+  /// 桌面端内联查看器的快照：打开时拷一份，_reload 截断 _items 不会波及查看器
+  /// （否则查看器 build 时 widget.items[_current] 越界崩溃）。移动端快照存在 shell 里。
+  List<MediaItem>? _viewerSnapshot;
   MediaService? _service;
 
   // folder navigation
   String? _currentFolderId;
-  final List<({String id, String name})> _folderPath = [];
+  final List<({String id, String name, bool hasPassword})> _folderPath = [];
   List<FolderItem> _folders = [];
   bool _breadcrumbExpanded = false;
 
@@ -374,17 +402,33 @@ class _GalleryViewState extends State<GalleryView>
 
   // ── 文件夹导航 ──
 
-  void _enterFolder(FolderItem folder) {
-    _folderPath.add((id: folder.id, name: folder.name));
+  void _enterFolder(FolderItem folder) async {
+    if (_selecting) _exitSelection();
+    if (folder.hasPassword && !_isUnlocked(folder.id)) {
+      final ok = await _showUnlockDialog(id: folder.id, name: folder.name);
+      if (!ok) return;
+      _markUnlocked(folder.id);
+    }
+    _folderPath.add((id: folder.id, name: folder.name, hasPassword: folder.hasPassword));
     _currentFolderId = folder.id;
-    _selected.clear();
-    _selecting = false;
     _breadcrumbExpanded = false;
+    _syncFolderDepth();
     if (_scrollCtrl.hasClients) _scrollCtrl.jumpTo(0);
     _reload(context.read<DisplayPrefs>());
   }
 
-  void _navigateToPathIndex(int index) {
+  void _navigateToPathIndex(int index) async {
+    // #11 面包屑目标可能是已过解锁时效的加密文件夹：导航前重新校验密码，
+    // 否则 TTL 形同虚设（进过就能一直靠面包屑白嫖）。
+    if (index >= 0) {
+      final target = _folderPath[index];
+      if (target.hasPassword && !_isUnlocked(target.id)) {
+        final ok = await _showUnlockDialog(id: target.id, name: target.name);
+        if (!ok || !mounted) return;
+        _markUnlocked(target.id);
+      }
+    }
+    if (!mounted) return;
     if (index < 0) {
       _folderPath.clear();
       _currentFolderId = null;
@@ -392,22 +436,39 @@ class _GalleryViewState extends State<GalleryView>
       _currentFolderId = _folderPath[index].id;
       _folderPath.removeRange(index + 1, _folderPath.length);
     }
-    _selected.clear();
-    _selecting = false;
+    if (_selecting) _exitSelection(); // #14 走 _exitSelection 才会同步底部操作条
     _breadcrumbExpanded = false;
+    _syncFolderDepth();
     if (_scrollCtrl.hasClients) _scrollCtrl.jumpTo(0);
     _reload(context.read<DisplayPrefs>());
   }
 
-  void _goBack() {
+  void _goBack() async {
     if (_folderPath.isEmpty) return;
+    // #11 回到的上一级若是已过时效的加密文件夹，同样要重新校验（根目录 index<0 无密码）
+    final targetIdx = _folderPath.length - 2;
+    if (targetIdx >= 0) {
+      final target = _folderPath[targetIdx];
+      if (target.hasPassword && !_isUnlocked(target.id)) {
+        final ok = await _showUnlockDialog(id: target.id, name: target.name);
+        if (!ok || !mounted) return;
+        _markUnlocked(target.id);
+      }
+    }
+    if (!mounted) return;
     _folderPath.removeLast();
     _currentFolderId = _folderPath.isEmpty ? null : _folderPath.last.id;
-    _selected.clear();
-    _selecting = false;
+    if (_selecting) _exitSelection(); // #14
     _breadcrumbExpanded = false;
+    _syncFolderDepth();
     if (_scrollCtrl.hasClients) _scrollCtrl.jumpTo(0);
     _reload(context.read<DisplayPrefs>());
+  }
+
+  void _syncFolderDepth() {
+    if (widget.shell != null) {
+      widget.shell!.updateFolderDepth(_folderPath.length, onGoBack: _goBack);
+    }
   }
 
   /// 系统返回手势/返回键的唯一处理入口。
@@ -533,6 +594,20 @@ class _GalleryViewState extends State<GalleryView>
               },
             ),
             ListTile(
+              leading: Icon(
+                folder.hasPassword ? Icons.lock_open : Icons.lock_outline,
+                color: c.onSurfaceVariant,
+              ),
+              title: Text(
+                folder.hasPassword ? '取消加密' : '设置密码',
+                style: TextStyle(color: c.onSurface),
+              ),
+              onTap: () {
+                Navigator.pop(ctx);
+                _showSetPasswordDialog(folder);
+              },
+            ),
+            ListTile(
               leading: Icon(Icons.delete_outline, color: c.error),
               title: Text('删除文件夹', style: TextStyle(color: c.error)),
               onTap: () {
@@ -549,6 +624,11 @@ class _GalleryViewState extends State<GalleryView>
 
   Future<void> _moveFolder(FolderItem folder) async {
     if (_service == null) return;
+    if (folder.hasPassword && !_isUnlocked(folder.id)) {
+      final ok = await _showUnlockDialog(id: folder.id, name: folder.name);
+      if (!ok || !mounted) return;
+      _markUnlocked(folder.id);
+    }
     final targetId = await _showFolderPicker(excludeFolderId: folder.id);
     if (targetId == null || !mounted) return;
     try {
@@ -630,10 +710,19 @@ class _GalleryViewState extends State<GalleryView>
 
   Future<void> _deleteFolderConfirm(FolderItem folder) async {
     if (_service == null) return;
+    if (folder.hasPassword && !_isUnlocked(folder.id)) {
+      final ok = await _showUnlockDialog(id: folder.id, name: folder.name);
+      if (!ok || !mounted) return;
+      _markUnlocked(folder.id);
+    }
+    // itemCount 是服务端递归统计的整棵子树数量，直接告诉用户会删掉多少
+    final message = folder.itemCount > 0
+        ? '确定删除文件夹「${folder.name}」？\n其中的 ${folder.itemCount} 项内容（含子文件夹）将一并删除。'
+        : '确定删除文件夹「${folder.name}」？';
     final confirmed = await appConfirmDialog(
       context,
       title: '删除文件夹',
-      message: '确定删除文件夹「${folder.name}」？\n文件夹必须为空才能删除。',
+      message: message,
       confirmLabel: '删除',
       destructive: true,
     );
@@ -646,6 +735,75 @@ class _GalleryViewState extends State<GalleryView>
       if (mounted) {
         showToast(context, '删除失败: ${errorText(e)}', kind: ToastKind.error);
       }
+    }
+  }
+
+  Future<String?> _showPinDialog({
+    required String title,
+    String? subtitle,
+  }) async {
+    return showDialog<String>(
+      context: context,
+      barrierDismissible: true,
+      builder: (_) => _PinInputDialog(
+        title: title,
+        subtitle: subtitle,
+        colors: context.colors,
+      ),
+    );
+  }
+
+  /// 解锁弹窗只弹一次：输错就 toast 一次并结束，不再循环重弹
+  /// （旧 while(true) 会一直怼在脸上，输错想退出都得先点取消）。
+  Future<bool> _showUnlockDialog({required String id, required String name}) async {
+    final pin = await _showPinDialog(
+      title: '输入密码',
+      subtitle: name,
+    );
+    if (pin == null || !mounted) return false;
+    // #39 弹框期间可能断线把 _service 置空，别 !_service 直接崩
+    final service = _service;
+    if (service == null) {
+      showToast(context, '未连接到服务器', kind: ToastKind.error);
+      return false;
+    }
+    final ok = await service.unlockFolder(id, pin);
+    if (!ok && mounted) {
+      showToast(context, '密码错误', kind: ToastKind.error);
+    }
+    return ok;
+  }
+
+  /// 加密入口只留两条路：没密码→设置密码；有密码→取消加密（先验证原密码）。
+  /// 不提供"修改密码"——要改就先取消再设置，一件事只有一种做法。
+  Future<void> _showSetPasswordDialog(FolderItem folder) async {
+    if (_service == null) return;
+
+    if (folder.hasPassword) {
+      final ok = await _showUnlockDialog(id: folder.id, name: folder.name);
+      if (!ok || !mounted) return;
+      try {
+        await _service!.setFolderPassword(folder.id, null);
+        _unlockedUntil.remove(folder.id);
+        if (mounted) showToast(context, '已取消加密', kind: ToastKind.success);
+        _refresh();
+      } catch (e) {
+        if (mounted) showToast(context, errorText(e), kind: ToastKind.error);
+      }
+      return;
+    }
+
+    final pin = await _showPinDialog(
+      title: '设置密码',
+      subtitle: folder.name,
+    );
+    if (pin == null || !mounted) return;
+    try {
+      await _service!.setFolderPassword(folder.id, pin);
+      if (mounted) showToast(context, '密码已设置', kind: ToastKind.success);
+      _refresh();
+    } catch (e) {
+      if (mounted) showToast(context, errorText(e), kind: ToastKind.error);
     }
   }
 
@@ -751,6 +909,7 @@ class _GalleryViewState extends State<GalleryView>
       final groupIds = group.items.map((e) => e.id).toSet();
       if (groupIds.every(_selected.contains)) {
         _selected.removeAll(groupIds);
+        if (_selected.isEmpty) _selecting = false; // #38 取消到空就退出选择态，别留个"已选 0"的操作条
       } else {
         _selected.addAll(groupIds);
       }
@@ -860,6 +1019,7 @@ class _GalleryViewState extends State<GalleryView>
       }
       _exitSelection();
       await _refresh();
+      HashSync.instance.syncFromServer();
     } on ApiException catch (e) {
       if (mounted) {
         showToast(context, '删除失败: ${e.displayMessage}', kind: ToastKind.error);
@@ -907,7 +1067,9 @@ class _GalleryViewState extends State<GalleryView>
 
     if (choice == _DownloadMode.zip) {
       try {
-        final dir = await DownloadService.instance.pickSaveDir();
+        // zip 不是媒体、进不了系统相册：桌面弹选择器，移动端落到应用文档 iGallery/
+        // （稳定可寻的固定位置，绝不写进会被清理、用户也看不见的 temp）。
+        final dir = await DownloadService.instance.pickDocumentDir();
         if (dir == null || !mounted) return; // 用户取消
         // 已存在同名 zip 就换个名，别把用户上次下的包盖掉
         final savePath = uniqueFile(dir.path, 'igallery.zip').path;
@@ -952,7 +1114,17 @@ class _GalleryViewState extends State<GalleryView>
         if (mounted) {
           // 如实汇报成功/失败数，不再一律"已下载 N 个"
           if (report.failed == 0) {
-            showToast(context, '已下载 ${report.ok} 个文件', kind: ToastKind.success);
+            showToast(
+              context,
+              isMobile
+                  ? '已保存 ${report.ok} 个到系统相册'
+                  : '已下载 ${report.ok} 个文件',
+              kind: ToastKind.success,
+              actionLabel: isMobile && _embedded ? '查看' : null,
+              onAction: isMobile && _embedded
+                  ? () => widget.shell?.showLocalDownloads()
+                  : null,
+            );
           } else if (report.ok == 0) {
             showToast(
               context,
@@ -996,7 +1168,7 @@ class _GalleryViewState extends State<GalleryView>
     if (_isDesktop || fromFiles) {
       // 桌面 / 移动端"从文件":任意类型,交由服务端判断能否入库
       final picked = await FilePicker.pickFiles(type: FileType.any);
-      files = picked
+      files = (picked?.files ?? [])
           .where((f) => f.path != null)
           .map((f) => PendingUpload(File(f.path!)))
           .toList();
@@ -1225,6 +1397,7 @@ class _GalleryViewState extends State<GalleryView>
             showToast(context, '已删除 ${item.filename}', kind: ToastKind.success);
           }
           _refresh();
+          HashSync.instance.syncFromServer();
         } on ApiException catch (e) {
           if (mounted) {
             showToast(
@@ -1290,19 +1463,42 @@ class _GalleryViewState extends State<GalleryView>
   bool get _embedded => widget.shell != null;
 
   void _openViewer(int index) {
-    if (_embedded && _service != null) {
+    // #15 守卫：item 可能因后台刷新已从 _items 移除，indexOf 得到 -1，
+    // 直接传给查看器会在 initState 里 items[-1] 崩溃。
+    if (index < 0 || index >= _items.length || _service == null) return;
+    if (_embedded) {
       widget.shell!.openViewer(
-        items: _items,
+        // #1 快照：查看器不再与网格共享同一个活列表，_reload 截断不会波及它
+        items: List.of(_items),
         index: index,
         service: _service!,
         onDeleted: (id) => setState(() {
           _items.removeWhere((m) => m.id == id);
           _itemIds.remove(id);
         }),
+        selecting: _selecting,
+        selectedIds: Set.of(_selected),
+        onToggleSelect: _toggleSelectFromViewer,
       );
     } else {
-      setState(() => _viewerIndex = index);
+      setState(() {
+        _viewerSnapshot = List.of(_items);
+        _viewerIndex = index;
+      });
     }
+  }
+
+  /// 查看器打开期间勾选/取消：保持选择态常开，不因清空而退出
+  /// （否则底部操作条会消失，且再选也无法恢复）。
+  void _toggleSelectFromViewer(String id) {
+    setState(() {
+      if (_selected.contains(id)) {
+        _selected.remove(id);
+      } else {
+        _selected.add(id);
+      }
+    });
+    _syncSelection();
   }
 
   void _syncSelection() {
@@ -1374,23 +1570,39 @@ class _GalleryViewState extends State<GalleryView>
             fit: StackFit.expand,
             children: [
               _buildContent(c, state, prefs),
-              if (_viewerIndex != null && _service != null)
+              if (_viewerIndex != null && _service != null && _viewerSnapshot != null)
                 MediaViewer(
-                  items: _items,
+                  items: _viewerSnapshot!,
                   initialIndex: _viewerIndex!,
                   service: _service!,
-                  onClose: () => setState(() => _viewerIndex = null),
+                  onClose: () => setState(() {
+                    _viewerIndex = null;
+                    _viewerSnapshot = null;
+                  }),
                   onDeleted: (id) {
                     setState(() {
                       _items.removeWhere((m) => m.id == id);
                       _itemIds.remove(id);
-                      if (_items.isEmpty) _viewerIndex = null;
+                      // 查看器持有的是 _viewerSnapshot，删除要同步从快照里摘掉
+                      _viewerSnapshot!.removeWhere((m) => m.id == id);
+                      if (_viewerSnapshot!.isEmpty) {
+                        _viewerIndex = null;
+                        _viewerSnapshot = null;
+                      }
                     });
                   },
+                  selecting: _selecting,
+                  selectedIds: _selected,
+                  onToggleSelect: _toggleSelectFromViewer,
                 ),
               if (_resolving)
                 _UploadOverlay(
-                  onHide: () => setState(() => _resolving = false),
+                  onHide: () {
+                    // 桌面端"后台上传"也要让顶部进度条接管（与移动端一致），
+                    // 否则点了后台就再也没有进度/取消入口了。
+                    UploadManager.instance.showBar();
+                    setState(() => _resolving = false);
+                  },
                 ),
             ],
           ),
@@ -1695,111 +1907,86 @@ class _GalleryViewState extends State<GalleryView>
   }
 
   Widget _buildBreadcrumbs(AppColors c) {
-    final last = _folderPath.length - 1;
-    final entries = <({int index, String label, bool current, bool ellipsis})>[
-      (index: -1, label: '首页', current: false, ellipsis: false),
-    ];
+    final style = TextStyle(
+      color: c.onSurfaceVariant,
+      fontSize: AppType.sm,
+      height: 1.3,
+    );
+    final sepStyle = style.copyWith(color: c.onMuted);
+    final depth = _folderPath.length;
+    final last = depth - 1;
+    final needCollapse = depth > 3 && !_breadcrumbExpanded;
 
-    if (_breadcrumbExpanded || _folderPath.length <= 2) {
-      for (var i = 0; i < _folderPath.length; i++) {
-        entries.add((
-          index: i,
-          label: _folderPath[i].name,
-          current: i == last,
-          ellipsis: false,
-        ));
-      }
-    } else {
-      entries.add((index: -2, label: '…', current: false, ellipsis: true));
-      entries.add((
-        index: last - 1,
-        label: _folderPath[last - 1].name,
-        current: false,
-        ellipsis: false,
-      ));
-      entries.add((
-        index: last,
-        label: _folderPath[last].name,
-        current: true,
-        ellipsis: false,
+    final segments = <InlineSpan>[];
+
+    void addSep() {
+      segments.add(TextSpan(text: ' / ', style: sepStyle));
+    }
+
+    void addTap(String label, VoidCallback onTap, {bool bold = false}) {
+      segments.add(WidgetSpan(
+        alignment: PlaceholderAlignment.baseline,
+        baseline: TextBaseline.alphabetic,
+        child: GestureDetector(
+          onTap: onTap,
+          behavior: HitTestBehavior.opaque,
+          child: Text(
+            label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: bold ? style.copyWith(
+              color: c.onSurface, fontWeight: FontWeight.w600,
+            ) : style,
+          ),
+        ),
       ));
     }
 
+    addTap('首页', () => _navigateToPathIndex(-1));
+
+    if (needCollapse) {
+      addSep();
+      segments.add(WidgetSpan(
+        alignment: PlaceholderAlignment.baseline,
+        baseline: TextBaseline.alphabetic,
+        child: GestureDetector(
+          onTap: () => setState(() => _breadcrumbExpanded = true),
+          behavior: HitTestBehavior.opaque,
+          child: Text('...', style: style.copyWith(fontWeight: FontWeight.w600)),
+        ),
+      ));
+      addSep();
+      addTap(
+        _folderPath[last - 1].name,
+        () => _navigateToPathIndex(last - 1),
+      );
+    } else {
+      for (var i = 0; i < depth - 1; i++) {
+        addSep();
+        addTap(_folderPath[i].name, () => _navigateToPathIndex(i));
+      }
+    }
+    addSep();
+    segments.add(TextSpan(
+      text: _folderPath[last].name,
+      style: style.copyWith(
+        color: c.onSurface,
+        fontWeight: FontWeight.w600,
+      ),
+    ));
+
     return Padding(
       padding: const EdgeInsets.fromLTRB(
-        AppSpace.lg,
-        AppSpace.md,
-        AppSpace.lg,
-        AppSpace.sm,
+        AppSpace.lg, AppSpace.md, AppSpace.lg, AppSpace.sm,
       ),
-      child: Wrap(
-        spacing: AppSpace.xs,
-        runSpacing: AppSpace.sm,
-        crossAxisAlignment: WrapCrossAlignment.center,
-        children: [
-          for (var i = 0; i < entries.length; i++)
-            if (i == 0)
-              _breadcrumbSegment(c, entries[i])
-            else
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(
-                    Icons.chevron_right,
-                    size: AppIconSize.sm,
-                    color: c.onMuted,
-                  ),
-                  const SizedBox(width: 2),
-                  _breadcrumbSegment(c, entries[i]),
-                ],
-              ),
-        ],
-      ),
-    );
-  }
-
-  Widget _breadcrumbSegment(
-    AppColors c,
-    ({int index, String label, bool current, bool ellipsis}) entry,
-  ) {
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: () {
-        if (entry.ellipsis) {
-          setState(() => _breadcrumbExpanded = true);
-          return;
-        }
-        if (entry.current) {
-          if (_breadcrumbExpanded) {
-            setState(() => _breadcrumbExpanded = false);
-          }
-          return;
-        }
-        _navigateToPathIndex(entry.index);
-      },
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 220, minHeight: 40),
-        child: Container(
-          alignment: Alignment.center,
-          padding: const EdgeInsets.symmetric(horizontal: AppSpace.md),
-          decoration: BoxDecoration(
-            color: entry.current
-                ? c.onSurface
-                : entry.ellipsis
-                ? c.brandSoft
-                : c.surface2,
-            borderRadius: BorderRadius.circular(AppRadius.chip),
-          ),
-          child: Text(
-            entry.label,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              color: entry.current ? c.onScrim : c.onSurface,
-              fontSize: AppType.xs,
-              fontWeight: FontWeight.w600,
-            ),
-          ),
+      child: GestureDetector(
+        onTap: _breadcrumbExpanded
+            ? () => setState(() => _breadcrumbExpanded = false)
+            : null,
+        child: Text.rich(
+          TextSpan(children: segments),
+          maxLines: _breadcrumbExpanded ? 5 : 1,
+          overflow: TextOverflow.ellipsis,
         ),
       ),
     );
@@ -1969,9 +2156,12 @@ class _GalleryViewState extends State<GalleryView>
                                   name: _folders[i].name,
                                   coverId: _folders[i].coverId,
                                   itemCount: _folders[i].itemCount,
+                                  hasPassword: _folders[i].hasPassword,
                                   service: _service!,
                                   onTap: () => _enterFolder(_folders[i]),
                                   onLongPress: () =>
+                                      _showFolderActions(_folders[i]),
+                                  onEdit: () =>
                                       _showFolderActions(_folders[i]),
                                 ),
                                 childCount: _folders.length,
@@ -2058,16 +2248,14 @@ class _GalleryViewState extends State<GalleryView>
                                       ),
                                       selecting: _selecting,
                                       prefs: prefs,
-                                      onTap: () {
-                                        if (_selecting) {
-                                          _toggleSelect(group.items[i].id);
-                                        } else {
-                                          _openViewer(
-                                            _items.indexOf(group.items[i]),
-                                          );
-                                        }
-                                      },
+                                      onTap: () => _openViewer(
+                                        _items.indexOf(group.items[i]),
+                                      ),
+                                      onToggleSelect: () => _toggleSelect(
+                                        group.items[i].id,
+                                      ),
                                       onLongPress: () {
+                                        HapticFeedback.mediumImpact();
                                         if (!_selecting) {
                                           setState(() => _selecting = true);
                                         }
@@ -2256,23 +2444,48 @@ class _FolderListTile extends StatelessWidget {
   final String name;
   final String? coverId;
   final int? itemCount;
+  final bool hasPassword;
   final MediaService service;
   final VoidCallback onTap;
   final VoidCallback? onLongPress;
+  final VoidCallback? onEdit;
 
   const _FolderListTile({
     super.key,
     required this.name,
     this.coverId,
     this.itemCount,
+    this.hasPassword = false,
     required this.service,
     required this.onTap,
     this.onLongPress,
+    this.onEdit,
   });
 
   @override
   Widget build(BuildContext context) {
     final c = context.colors;
+    Widget coverWidget;
+    if (coverId != null && hasPassword) {
+      // 客户端强马赛克+锁，不再请求服务端 _blur.jpg（该管线已删除）
+      coverWidget = LockedCover(coverId: coverId!, service: service);
+    } else if (coverId != null) {
+      coverWidget = CachedThumb(
+        id: coverId!,
+        url: service.thumbUrl(coverId!),
+        headers: service.authHeaders,
+      );
+    } else {
+      coverWidget = Container(
+        color: c.surface2,
+        child: Icon(
+          hasPassword ? Icons.folder_off_outlined : Icons.folder_outlined,
+          color: c.onMuted,
+          size: AppIconSize.xl,
+        ),
+      );
+    }
+
     return InkWell(
       onTap: onTap,
       onLongPress: onLongPress,
@@ -2280,43 +2493,34 @@ class _FolderListTile extends StatelessWidget {
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
         child: Row(
           children: [
-            // 封面缩略图或图标
             ClipRRect(
               borderRadius: BorderRadius.circular(AppRadius.card),
-              child: SizedBox(
-                width: 60,
-                height: 60,
-                child: coverId != null
-                    ? CachedThumb(
-                        id: coverId!,
-                        url: service.thumbUrl(coverId!),
-                        headers: service.authHeaders,
-                      )
-                    : Container(
-                        color: c.surface2,
-                        child: Icon(
-                          Icons.folder_outlined,
-                          color: c.onMuted,
-                          size: AppIconSize.xl,
-                        ),
-                      ),
-              ),
+              child: SizedBox(width: 60, height: 60, child: coverWidget),
             ),
             const SizedBox(width: 14),
-            // 名称 + 子标题
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                    name,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      color: c.onSurface,
-                      fontSize: AppType.sm,
-                      fontWeight: FontWeight.w500,
-                    ),
+                  Row(
+                    children: [
+                      if (hasPassword) Padding(
+                        padding: const EdgeInsets.only(right: 4),
+                        child: Icon(Icons.lock_rounded, size: 14, color: c.onMuted),
+                      ),
+                      Flexible(
+                        child: Text(
+                          name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: c.onSurface,
+                            fontSize: AppType.sm,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
                   const SizedBox(height: 2),
                   Text(
@@ -2326,6 +2530,15 @@ class _FolderListTile extends StatelessWidget {
                 ],
               ),
             ),
+            if (onEdit != null)
+              GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: onEdit,
+                child: Padding(
+                  padding: const EdgeInsets.all(8),
+                  child: Icon(Icons.edit_outlined, color: c.onMuted, size: AppIconSize.md),
+                ),
+              ),
             Icon(Icons.chevron_right, color: c.onMuted, size: AppIconSize.lg),
           ],
         ),
@@ -2464,6 +2677,133 @@ class _UploadOverlayState extends State<_UploadOverlay> {
               ],
             ),
           ),
+        ),
+      ),
+    );
+  }
+}
+
+// ── PIN 输入弹窗 ──
+
+class _PinInputDialog extends StatefulWidget {
+  final String title;
+  final String? subtitle;
+  final AppColors colors;
+  const _PinInputDialog({
+    required this.title,
+    this.subtitle,
+    required this.colors,
+  });
+
+  @override
+  State<_PinInputDialog> createState() => _PinInputDialogState();
+}
+
+class _PinInputDialogState extends State<_PinInputDialog> {
+  final _ctrl = TextEditingController();
+  final _focus = FocusNode();
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl.addListener(_onChanged);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _focus.requestFocus());
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    _focus.dispose();
+    super.dispose();
+  }
+
+  void _onChanged() {
+    setState(() {});
+    if (_ctrl.text.length == 4) {
+      final pin = _ctrl.text;
+      Navigator.pop(context, pin);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = widget.colors;
+    final text = _ctrl.text;
+    return Dialog(
+      backgroundColor: c.surface,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(24, 28, 24, 20),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.lock_rounded, size: 28, color: c.onMuted),
+            const SizedBox(height: 12),
+            Text(widget.title, style: TextStyle(
+              color: c.onSurface, fontSize: AppType.mdPlus,
+              fontWeight: FontWeight.w700,
+            )),
+            if (widget.subtitle != null) ...[
+              const SizedBox(height: 4),
+              Text(widget.subtitle!, style: TextStyle(
+                color: c.onMuted, fontSize: AppType.xs,
+              )),
+            ],
+            const SizedBox(height: 24),
+            GestureDetector(
+              onTap: () => _focus.requestFocus(),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: List.generate(4, (i) {
+                  final filled = i < text.length;
+                  return Container(
+                    width: 48,
+                    height: 48,
+                    margin: EdgeInsets.only(left: i > 0 ? 12 : 0),
+                    decoration: BoxDecoration(
+                      border: Border.all(
+                        color: i == text.length ? c.brand : c.outline,
+                        width: i == text.length ? 2 : 1,
+                      ),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    alignment: Alignment.center,
+                    child: filled
+                        ? Container(
+                            width: 12,
+                            height: 12,
+                            decoration: BoxDecoration(
+                              color: c.onSurface,
+                              shape: BoxShape.circle,
+                            ),
+                          )
+                        : null,
+                  );
+                }),
+              ),
+            ),
+            SizedBox(
+              width: 0,
+              height: 0,
+              child: TextField(
+                controller: _ctrl,
+                focusNode: _focus,
+                keyboardType: const TextInputType.numberWithOptions(),
+                inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                maxLength: 4,
+                autofocus: true,
+                decoration: const InputDecoration(
+                  counterText: '',
+                  border: InputBorder.none,
+                ),
+              ),
+            ),
+            const SizedBox(height: 20),
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: Text('取消', style: TextStyle(color: c.onMuted)),
+            ),
+          ],
         ),
       ),
     );

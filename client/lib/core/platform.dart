@@ -9,3 +9,6 @@ bool get isDesktop {
 }
 
 bool get isMobile => !isDesktop;
+
+/// Android 独有逻辑（如 MANAGE_MEDIA 授权引导，见 core/media_permission.dart）只准用这个门控
+bool get isAndroid => defaultTargetPlatform == TargetPlatform.android;

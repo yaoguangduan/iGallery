@@ -93,6 +93,9 @@ class _DragSelectDetectorState extends State<DragSelectDetector> {
 
   /// 两条路径共用的起手逻辑。返回是否真的开始了滑选。
   bool _begin(Offset globalPosition) {
+    // 已有一指在滑选就忽略第二指：否则第二次 onStart 会覆盖上层的
+    // _sweepAnchor/_sweepBaseline，双指（本意是捏合缩放列数）时选择区来回跳。
+    if (_lastIndex != null) return false;
     final idx = _indexAt(globalPosition);
     if (idx == null) return false;
     if (!widget.onStart(idx)) return false;

@@ -18,6 +18,7 @@ pub struct FolderInfo {
     pub cover_id: Option<String>,
     pub cover_media_type: Option<String>,
     pub item_count: i64,
+    pub has_password: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -54,6 +55,7 @@ pub async fn create_folder(
         parent_id: body.parent_id,
         created_at: now.clone(),
         updated_at: now,
+        password_hash: None,
     };
     if let Err(e) = db::insert_folder(&state.pool, &row).await {
         tracing::error!("insert_folder: {e}");
@@ -63,6 +65,7 @@ pub async fn create_folder(
     let info = FolderInfo {
         id: row.id, name: row.name, parent_id: row.parent_id,
         cover_id: None, cover_media_type: None, item_count: 0,
+        has_password: false,
         created_at: row.created_at, updated_at: row.updated_at,
     };
     (StatusCode::CREATED, Json(info)).into_response()
@@ -86,7 +89,7 @@ pub async fn list_folders(
             let out: Vec<FolderInfo> = rows.into_iter().map(|m| FolderInfo {
                 id: m.row.id, name: m.row.name, parent_id: m.row.parent_id,
                 cover_id: m.cover_id, cover_media_type: m.cover_media_type,
-                item_count: m.item_count,
+                item_count: m.item_count, has_password: m.has_password,
                 created_at: m.row.created_at, updated_at: m.row.updated_at,
             }).collect();
             Json(out).into_response()
@@ -111,13 +114,15 @@ pub async fn get_folder(
                         Json(FolderInfo {
                             id: m.row.id, name: m.row.name, parent_id: m.row.parent_id,
                             cover_id: m.cover_id, cover_media_type: m.cover_media_type,
-                            item_count: m.item_count,
+                            item_count: m.item_count, has_password: m.has_password,
                             created_at: m.row.created_at, updated_at: m.row.updated_at,
                         }).into_response()
                     } else {
+                        let has_pw = row.password_hash.is_some();
                         Json(FolderInfo {
                             id: row.id, name: row.name, parent_id: row.parent_id,
                             cover_id: None, cover_media_type: None, item_count: 0,
+                            has_password: has_pw,
                             created_at: row.created_at, updated_at: row.updated_at,
                         }).into_response()
                     }
@@ -136,6 +141,7 @@ pub async fn get_folder(
 pub struct PatchBody {
     pub name: Option<String>,
     pub parent_id: Option<String>,
+    pub password: Option<String>,
 }
 
 pub async fn patch_folder(
@@ -178,6 +184,26 @@ pub async fn patch_folder(
             Err(e) => { tracing::error!("move_folder: {e}"); return StatusCode::INTERNAL_SERVER_ERROR.into_response(); }
         }
     }
+    if let Some(ref pw) = body.password {
+        if pw.is_empty() {
+            if let Err(e) = db::set_folder_password(&state.pool, &id, None).await {
+                tracing::error!("clear_password: {e}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        } else {
+            let pw_clone = pw.clone();
+            let hash = match tokio::task::spawn_blocking(move || {
+                bcrypt::hash(&pw_clone, bcrypt::DEFAULT_COST)
+            }).await {
+                Ok(Ok(h)) => h,
+                _ => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            };
+            if let Err(e) = db::set_folder_password(&state.pool, &id, Some(&hash)).await {
+                tracing::error!("set_password: {e}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    }
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -192,15 +218,38 @@ pub async fn delete_folder(
         Err(e) => { tracing::error!("get_folder: {e}"); return StatusCode::INTERNAL_SERVER_ERROR.into_response(); }
         _ => {}
     }
-    let has_children = db::folder_has_children(&state.pool, &id).await.unwrap_or(true);
-    let has_media = db::folder_has_media(&state.pool, &id).await.unwrap_or(true);
-    if has_children || has_media {
-        return (StatusCode::CONFLICT, Json(serde_json::json!({"error": "文件夹不为空"}))).into_response();
-    }
-    match db::delete_folder(&state.pool, &id).await {
+    // 非空也直接删：子树内的媒体逻辑删除、子文件夹一并移除（客户端弹确认）
+    match db::delete_folder_tree(&state.pool, &id).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => { tracing::error!("delete_folder: {e}"); StatusCode::INTERNAL_SERVER_ERROR.into_response() }
     }
+}
+
+// ── POST /v1/folders/{id}/unlock ──
+
+#[derive(serde::Deserialize)]
+pub struct UnlockBody {
+    pub password: String,
+}
+
+pub async fn unlock_folder(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<UnlockBody>,
+) -> impl IntoResponse {
+    let hash = match db::get_folder_password_hash(&state.pool, &id).await {
+        Ok(Some(h)) => h,
+        Ok(None) => return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "文件夹没有密码"}))).into_response(),
+        Err(e) => { tracing::error!("unlock: {e}"); return StatusCode::INTERNAL_SERVER_ERROR.into_response(); }
+    };
+    let pw = body.password.clone();
+    let valid = tokio::task::spawn_blocking(move || bcrypt::verify(&pw, &hash))
+        .await.unwrap_or(Ok(false)).unwrap_or(false);
+    // 密码错用 200 {unlocked:false} 表达，绝不用 401 —— 401/403 是客户端全局鉴权钩子
+    // 判定"服务器 token 失效"的信号，会清空 token 并断连；文件夹密码错若也回 401，
+    // 会把整个服务器鉴权一起搞挂（之后输对的 PIN 也因无 token 被中间件 401 而永远失败）。
+    Json(serde_json::json!({"unlocked": valid})).into_response()
 }
 
 // ── GET /v1/folders/{id}/ancestors ──

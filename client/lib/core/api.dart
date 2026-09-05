@@ -151,6 +151,15 @@ class Api {
     return ApiException(kind, msg, statusCode: code);
   }
 
+  /// 给上传这类直接用 client.send、绕过 _send 的流式请求复用同一套
+  /// 错误分类 + 日志 + 401 钩子。否则上传的非 2xx 自成一派：401 不触发
+  /// needAuth 迁移、403 被误判成 server、用户看到裸 "upload 401"。
+  ApiException errorFromResponse(int statusCode, String body) {
+    final e = _fromStatus(statusCode, body);
+    _logError(e);
+    return e;
+  }
+
   Future<dynamic> getJson(String path, {Map<String, String>? query, Duration? timeout}) {
     return _wrap(() async {
       final resp = await _client

@@ -8,13 +8,16 @@ import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:photo_view/photo_view.dart';
 import 'package:provider/provider.dart';
+import 'package:share_plus/share_plus.dart';
 
 import '../../core/api.dart';
 import '../../core/disk_cache.dart';
 import '../../core/display_prefs.dart';
 import '../../core/download_service.dart';
+import '../../core/hash_sync.dart';
 import '../../core/kv_store.dart';
 import '../../core/media_service.dart';
+import '../../core/platform.dart';
 import '../../core/time_fmt.dart';
 import '../../theme/app_theme.dart';
 import 'app_kit.dart';
@@ -221,6 +224,7 @@ class _MediaViewerState extends State<MediaViewer> with TickerProviderStateMixin
     }
     if (!mounted) return;
     showToast(context, '已删除 $name', kind: ToastKind.success);
+    HashSync.instance.syncFromServer();
     widget.onDeleted?.call(id);
     if (widget.items.length <= 1) { _close(); return; }
     setState(() {
@@ -271,11 +275,39 @@ class _MediaViewerState extends State<MediaViewer> with TickerProviderStateMixin
       if (!mounted) return;
       if (savePath == null) return; // 用户取消
       final name = savePath.split(Platform.pathSeparator).last;
-      showToast(context, '已下载 $name', kind: ToastKind.success);
+      showToast(
+        context,
+        isMobile ? '已保存到系统相册 iGallery' : '已下载 $name',
+        kind: ToastKind.success,
+      );
     } on ApiException catch (e) {
       if (mounted) showToast(context, '下载失败: ${e.displayMessage}', kind: ToastKind.error);
     } catch (_) {
       if (mounted) showToast(context, '下载失败', kind: ToastKind.error);
+    }
+  }
+
+  Future<void> _shareCurrent() async {
+    final item = _item;
+    try {
+      var file = DiskCache.instance.cachedMediaSync(item.id);
+      file ??= await DiskCache.instance.getMedia(
+        item.id,
+        widget.service.fullUrl(item.id),
+        widget.service.authHeaders,
+        isVideo: item.isVideo,
+        knownSize: item.size,
+      );
+      if (file == null || !mounted) {
+        if (mounted) showToast(context, '无法获取文件', kind: ToastKind.error);
+        return;
+      }
+      final mime = item.isVideo ? 'video/*' : 'image/*';
+      await Share.shareXFiles(
+        [XFile(file.path, mimeType: mime)],
+      );
+    } catch (e) {
+      if (mounted) showToast(context, '分享失败: $e', kind: ToastKind.error);
     }
   }
 
@@ -497,6 +529,7 @@ class _MediaViewerState extends State<MediaViewer> with TickerProviderStateMixin
                     onTap: _toggleFavorite,
                     color: _item.isFavorite ? _kViewerFav : null,
                     tooltip: _item.isFavorite ? '取消收藏' : '收藏'),
+                  _IcoBtn(Icons.share, onTap: _shareCurrent, tooltip: '分享'),
                   PopupMenuButton<String>(
                     icon: const Icon(Icons.more_vert, color: Colors.white70, size: 20),
                     color: Colors.grey[900],

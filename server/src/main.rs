@@ -45,6 +45,20 @@ struct Cli {
     /// 鉴权 token（未指定则关闭鉴权）
     #[arg(long, env = "IGALLERY_TOKEN")]
     token: Option<String>,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(clap::Subcommand)]
+enum Commands {
+    /// 列出所有文件夹及密码状态
+    Folders,
+    /// 清除指定文件夹的密码
+    ResetPassword {
+        /// 文件夹 ID
+        folder_id: String,
+    },
 }
 
 #[derive(Clone)]
@@ -81,6 +95,40 @@ async fn main() {
     tokio::fs::create_dir_all(&thumbs_dir).await.expect("create thumbs dir");
 
     let pool = db::init_pool(&data_dir).await.expect("open sqlite");
+
+    // CLI 子命令：不启动服务器，直接操作数据库后退出
+    if let Some(cmd) = cli.command {
+        match cmd {
+            Commands::Folders => {
+                let folders = db::list_all_folders(&pool).await.expect("list folders");
+                if folders.is_empty() {
+                    println!("No folders found.");
+                } else {
+                    println!("{:<38} {:<30} {}", "ID", "Name", "Password");
+                    println!("{}", "-".repeat(78));
+                    for f in &folders {
+                        let pw = if f.password_hash.is_some() { "YES" } else { "no" };
+                        println!("{:<38} {:<30} {}", f.id, f.name, pw);
+                    }
+                    println!("\nTotal: {} folders", folders.len());
+                }
+            }
+            Commands::ResetPassword { folder_id } => {
+                match db::set_folder_password(&pool, &folder_id, None).await {
+                    Ok(true) => println!("Password cleared for folder {folder_id}"),
+                    Ok(false) => {
+                        eprintln!("Folder {folder_id} not found");
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+        return;
+    }
 
     // mDNS：失败不致命 (R1)，只警告，降级为"无自动发现"继续服务。
     // 旧实现在二次失败时 process::exit(0) —— 在不支持组播的容器里
@@ -131,6 +179,7 @@ async fn main() {
         .route("/v1/folders",           routing::get(folder::list_folders).post(folder::create_folder))
         .route("/v1/folders/{id}",      routing::get(folder::get_folder).patch(folder::patch_folder).delete(folder::delete_folder))
         .route("/v1/folders/{id}/ancestors", routing::get(folder::get_ancestors))
+        .route("/v1/folders/{id}/unlock",    routing::post(folder::unlock_folder))
         .route("/v1/auth",              routing::get(auth::auth_probe))
         .route("/v1/info",              routing::get(media::server_info))
         .route("/v1/logs",              routing::post(receive_client_logs))
@@ -145,13 +194,15 @@ async fn main() {
         .route("/v1/media/download",    routing::post(media::download_batch))
         .route("/v1/media/{id}",        routing::get(media::get_media))
         .route("/v1/media/{id}/thumb",  routing::get(media::get_thumb))
-        .route("/v1/media/{id}/download", routing::get(media::download_single));
+        .route("/v1/media/{id}/download", routing::get(media::download_single))
+        // 4GB 上限只给上传这组：JSON 端点(query/probe/batch)保留 axum 默认 2MB，
+        // 否则畸形/恶意客户端能往 /v1/media/query 灌几个 G 的 body 把服务端 OOM。
+        .layer(DefaultBodyLimit::max(4 * 1024 * 1024 * 1024));
 
     let app = Router::new()
         .merge(fast)
         .merge(slow)
         .layer(middleware::from_fn_with_state(state.clone(), auth::require_token))
-        .layer(DefaultBodyLimit::max(4 * 1024 * 1024 * 1024)) // 4 GB
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -196,13 +247,17 @@ async fn purge_loop(pool: sqlx::SqlitePool, media_dir: PathBuf, thumbs_dir: Path
         if rows.is_empty() { continue; }
 
         match db::purge_ids(&pool, &rows).await {
-            Ok(n) if n > 0 => {
-                for (id, ext) in &rows {
+            Ok(deleted) if !deleted.is_empty() => {
+                // 只删真正被 purge 掉的行对应的文件：deleted 是 DELETE … RETURNING 的结果，
+                // 已排除了 select 之后被 restore 的条目，绝不误删活文件的磁盘副本。
+                for (id, ext) in &deleted {
                     // 文件删不掉只告警：行已经没了，客户端不会再引用到
                     let _ = tokio::fs::remove_file(media_dir.join(format!("{id}.{ext}"))).await;
                     let _ = tokio::fs::remove_file(thumbs_dir.join(format!("{id}.jpg"))).await;
+                    // _blur.jpg 已不再生成（加密封面马赛克移到客户端），这行专清历史遗留
+                    let _ = tokio::fs::remove_file(thumbs_dir.join(format!("{id}_blur.jpg"))).await;
                 }
-                tracing::info!("purge: 物理清理了 {n} 条删除超过 30 天的记录");
+                tracing::info!("purge: 物理清理了 {} 条删除超过 30 天的记录", deleted.len());
             }
             Ok(_) => {}
             Err(e) => tracing::warn!("purge delete: {e}"),
@@ -270,7 +325,10 @@ async fn migrate_legacy_checksums(
             "checksum migration: XXH3-128 migrated={migrated}, read_failed={read_failed}, db_failed={db_failed}"
         );
     }
-    read_failed == 0 && db_failed == 0
+    // 只有前面的"批次查询失败"才是致命的（DB 坏了 → 提前 return false）。
+    // 单个文件读不了（被手动删了/损坏）或单条 set_checksum 失败都不是致命错误：
+    // 那一行保持旧/空 checksum、暂不参与秒传即可，绝不能因为一个坏文件让服务器永远起不来。
+    true
 }
 
 #[derive(serde::Deserialize)]

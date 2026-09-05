@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../../core/display_prefs.dart';
+import '../../core/hash_sync.dart';
 import '../../core/media_service.dart';
 import '../../core/server_state.dart';
 import '../../theme/app_theme.dart';
@@ -28,6 +29,8 @@ class _SearchTabState extends State<SearchTab> {
   int _total = 0;
   String? _nextCursor;
   String _query = '';
+  // 请求时序：快速改词/翻页时丢弃过期响应，否则慢的旧查询会覆盖/混进新结果
+  int _searchSeq = 0;
   MediaService? _service;
 
   bool _selecting = false;
@@ -71,6 +74,7 @@ class _SearchTabState extends State<SearchTab> {
     final trimmed = q.trim();
     if (trimmed == _query) return;
     _query = trimmed;
+    final seq = ++_searchSeq; // 使本次之前所有在途请求作废
     if (_query.isEmpty || _service == null) {
       setState(() {
         _items.clear();
@@ -88,7 +92,7 @@ class _SearchTabState extends State<SearchTab> {
         sort: _buildSort(prefs),
         withTotal: true,
       );
-      if (!mounted) return;
+      if (!mounted || seq != _searchSeq) return; // 过期响应直接丢
       setState(() {
         _items.clear();
         _items.addAll(result.items);
@@ -97,7 +101,7 @@ class _SearchTabState extends State<SearchTab> {
         _loading = false;
       });
     } catch (e) {
-      if (!mounted) return;
+      if (!mounted || seq != _searchSeq) return;
       setState(() => _loading = false);
       showToast(context, '搜索失败', kind: ToastKind.error);
     }
@@ -105,7 +109,9 @@ class _SearchTabState extends State<SearchTab> {
 
   Future<void> _loadMore() async {
     if (_loading || _nextCursor == null || _service == null) return;
-    _loading = true;
+    final seq = _searchSeq;
+    final query = _query;
+    setState(() => _loading = true);
     try {
       final prefs = context.read<DisplayPrefs>();
       final result = await _service!.query(
@@ -114,14 +120,16 @@ class _SearchTabState extends State<SearchTab> {
         filter: _buildFilter(prefs),
         sort: _buildSort(prefs),
       );
-      if (!mounted) return;
+      // 翻页途中若换了查询词，这页属于旧查询，丢弃（否则会混进新结果、游标也串了）
+      if (!mounted || seq != _searchSeq || query != _query) return;
       setState(() {
         _items.addAll(result.items);
         _nextCursor = result.nextCursor;
         _loading = false;
       });
     } catch (_) {
-      _loading = false;
+      if (!mounted || seq != _searchSeq) return;
+      setState(() => _loading = false); // 旧写法漏了 setState，失败后底部转圈永远不停
     }
   }
 
@@ -188,8 +196,40 @@ class _SearchTabState extends State<SearchTab> {
         });
         _syncSelection();
       },
+      onDelete: _deleteSelected,
       onExitSelection: _exitSelection,
     );
+  }
+
+  /// 搜索结果就是服务端媒体，删除复用 batchDelete。
+  /// 只注册"全选 + 删除"两个动作——shell 的选择条按回调是否为空决定显示哪些按钮，
+  /// 收藏/移动/下载没注册就不显示（旧版会显示 4 个点了没反应的死按钮）。
+  Future<void> _deleteSelected() async {
+    if (_selected.isEmpty || _service == null) return;
+    final count = _selected.length;
+    final ok = await appConfirmDialog(
+      context,
+      title: '删除',
+      message: '确定删除选中的 $count 个文件？',
+      confirmLabel: '删除',
+      destructive: true,
+    );
+    if (!ok || !mounted) return;
+    try {
+      await _service!.batchDelete(_selected.toList());
+      if (!mounted) return;
+      setState(() {
+        _items.removeWhere((m) => _selected.contains(m.id));
+        _total = _items.length;
+        _selected.clear();
+        _selecting = false;
+      });
+      _syncSelection();
+      HashSync.instance.syncFromServer();
+      showToast(context, '已删除 $count 个', kind: ToastKind.success);
+    } catch (e) {
+      if (mounted) showToast(context, '删除失败', kind: ToastKind.error);
+    }
   }
 
   @override

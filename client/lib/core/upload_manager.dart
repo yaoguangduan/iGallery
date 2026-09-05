@@ -6,6 +6,8 @@ import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:uuid/uuid.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
+import 'package:http/http.dart' as http;
+
 import 'api.dart';
 import 'hash_sync.dart';
 import 'media_service.dart';
@@ -47,10 +49,17 @@ class UploadManager extends ChangeNotifier {
   /// 看门狗只盯"有没有在动"，慢但在动的传输不会被误杀。
   static const Duration _stallTimeout = Duration(seconds: 180);
 
+  /// 断网后自动重试的最长等待时间。
+  static const Duration _retryWindow = Duration(minutes: 5);
+
+  /// 重试探测间隔。
+  static const Duration _retryInterval = Duration(seconds: 10);
+
   bool _uploading = false;
   bool _dismissed = true; // 进度条是否已收起
   bool _barVisible = false; // 顶部条只在用户点"后台"后才显示
   bool _keepAliveActive = false; // 前台服务是否真的起来了（决定要不要 updateService）
+  bool _retrying = false; // 断网重试中
   int _total = 0;
   int _completed = 0;
   int _dedupCount = 0;
@@ -72,8 +81,10 @@ class UploadManager extends ChangeNotifier {
   String _currentFilename = '';
   String? _lastError;
   UploadCancelToken? _cancelToken;
+  Completer<void>? _retryGate;
 
   bool get uploading => _uploading;
+  bool get retrying => _retrying;
   String? get lastError => _lastError;
   bool get cancelling => _cancelToken?.isCancelled ?? false;
 
@@ -99,10 +110,10 @@ class UploadManager extends ChangeNotifier {
     return Duration(seconds: ((_totalBytes - sent) / _speedBps).round());
   }
 
-  /// 用户点"取消"：停掉剩余文件，正在传的那个立刻断流。
-  /// 服务端收不到完整 multipart，会删掉临时文件且不写库 —— 相当于没传过。
+  /// 用户点"取消"：停掉剩余文件、中止重试等待、正在传的那个立刻断流。
   void cancel() {
     _cancelToken?.cancel();
+    _retryGate?.complete();
     notifyListeners();
   }
 
@@ -116,6 +127,60 @@ class UploadManager extends ChangeNotifier {
   void dismiss() {
     _dismissed = true;
     notifyListeners();
+  }
+
+  /// 断网后循环探测服务器，直到恢复或超时/取消。
+  /// 返回 true 表示恢复连接，false 表示超时或被取消。
+  Future<bool>? _retryFuture;
+
+  Future<bool> _waitForConnection(UploadCancelToken token) {
+    _retryFuture ??= _doRetryProbe(token).whenComplete(() {
+      _retryFuture = null;
+    });
+    return _retryFuture!;
+  }
+
+  Future<bool> _doRetryProbe(UploadCancelToken token) async {
+    _retrying = true;
+    _retryGate ??= Completer<void>();
+    _speedBps = 0;
+    notifyListeners();
+    _updateNotificationRetry();
+
+    final deadline = DateTime.now().add(_retryWindow);
+    try {
+      while (DateTime.now().isBefore(deadline)) {
+        if (token.isCancelled) return false;
+        final base = apiConfig.baseUrl;
+        if (base != null && base.isNotEmpty) {
+          final info = await Api.instance.probe(base, token: apiConfig.token);
+          if (info != null) return true;
+        }
+        if (token.isCancelled) return false;
+        final gate = _retryGate;
+        if (gate != null && !gate.isCompleted) {
+          await Future.any([
+            Future.delayed(_retryInterval),
+            gate.future,
+          ]);
+        } else {
+          await Future.delayed(_retryInterval);
+        }
+      }
+      return false;
+    } finally {
+      _retrying = false;
+      _retryGate = null;
+      notifyListeners();
+    }
+  }
+
+  void _updateNotificationRetry() {
+    if (!isMobile || Platform.isIOS || !_keepAliveActive) return;
+    FlutterForegroundTask.updateService(
+      notificationTitle: '上传暂停 — 等待网络恢复',
+      notificationText: '已完成 $_completed/$_total',
+    );
   }
 
   Future<void> _acquireKeepAlive(int count) async {
@@ -184,6 +249,9 @@ class UploadManager extends ChangeNotifier {
     _lastNotifyAt = null;
     _currentFilename = '';
     _lastError = null;
+    _retrying = false;
+    _retryGate = null;
+    _retryFuture = null;
 
     await _acquireKeepAlive(files.length);
 
@@ -244,94 +312,144 @@ class UploadManager extends ChangeNotifier {
         _inflightBytes[slot] = 0;
         notifyListeners();
 
-        // 看门狗：只要字节还在动就续命，静止超过 _stallTimeout 判定卡死
-        var lastMoveAt = DateTime.now();
-        final watchdog = Timer.periodic(const Duration(seconds: 5), (_) {
-          if (DateTime.now().difference(lastMoveAt) > _stallTimeout) {
-            token.cancel();
-          }
-        });
+        var succeeded = false;
+        var retryable = true;
+        while (retryable) {
+          retryable = false;
 
-        try {
-          final result = await service.uploadFile(
-            file,
-            folderId: folderId,
-            takenAtIso: pending.takenAtIso,
-            cancelToken: token,
-            onSent: (sent) {
-              lastMoveAt = DateTime.now();
-              _inflightBytes[slot] = sent;
-              _throttledTick();
-            },
-          );
-          if (result != null) {
-            if (result.dedup) _dedupCount++;
-            await UploadHistory.markFinished(
-              id: hid,
-              status: result.dedup ? UploadStatus.dedup : UploadStatus.success,
-              serverId: result.item.id,
-              thumbId: result.item.id,
-            );
-            final checksum = result.item.checksum;
-            if (checksum != null) {
-              try {
-                await HashSync.instance.add(checksum);
-                if (pending.assetId != null &&
-                    pending.assetFingerprint != null) {
-                  await HashSync.instance.cacheAssetChecksum(
-                    pending.assetId!,
-                    pending.assetFingerprint!,
-                    checksum,
-                  );
-                }
-              } catch (_) {
-                // 本地缓存失败不能把已经成功的服务器上传反标成失败。
-              }
+          // 看门狗：只要字节还在动就续命，静止超过 _stallTimeout 判定卡死
+          var lastMoveAt = DateTime.now();
+          final watchdog = Timer.periodic(const Duration(seconds: 5), (_) {
+            if (DateTime.now().difference(lastMoveAt) > _stallTimeout) {
+              token.cancel();
             }
-          } else {
-            _failCount++;
-            _lastError = '服务器未返回结果';
-            await UploadHistory.markFinished(
-              id: hid,
-              status: UploadStatus.failed,
-              error: '服务器未返回结果',
+          });
+
+          try {
+            final result = await service.uploadFile(
+              file,
+              folderId: folderId,
+              takenAtIso: pending.takenAtIso,
+              cancelToken: token,
+              onSent: (sent) {
+                lastMoveAt = DateTime.now();
+                _inflightBytes[slot] = sent;
+                _throttledTick();
+              },
             );
-          }
-        } on UploadCancelledException {
-          _cancelCount++;
-          await UploadHistory.markFinished(
-            id: hid,
-            status: UploadStatus.cancelled,
-            error: '已取消',
-          );
-        } on ApiException catch (e) {
-          _failCount++;
-          _lastError = e.displayMessage;
-          await UploadHistory.markFinished(
-            id: hid,
-            status: UploadStatus.failed,
-            error: e.displayMessage,
-          );
-        } on Object catch (e) {
-          // 取消会让底层连接抛各种 ClientException，归到"已取消"而不是"失败"
-          if (token.isCancelled) {
+            if (result != null) {
+              succeeded = true;
+              if (result.dedup) _dedupCount++;
+              await UploadHistory.markFinished(
+                id: hid,
+                status:
+                    result.dedup ? UploadStatus.dedup : UploadStatus.success,
+                serverId: result.item.id,
+                thumbId: result.item.id,
+              );
+              final checksum = result.item.checksum;
+              if (checksum != null) {
+                try {
+                  await HashSync.instance.add(checksum);
+                  if (pending.assetId != null &&
+                      pending.assetFingerprint != null) {
+                    await HashSync.instance.cacheAssetChecksum(
+                      pending.assetId!,
+                      pending.assetFingerprint!,
+                      checksum,
+                    );
+                  }
+                } catch (_) {}
+              }
+            } else {
+              _failCount++;
+              _lastError = '服务器未返回结果';
+              await UploadHistory.markFinished(
+                id: hid,
+                status: UploadStatus.failed,
+                error: '服务器未返回结果',
+              );
+            }
+          } on UploadCancelledException {
             _cancelCount++;
             await UploadHistory.markFinished(
               id: hid,
               status: UploadStatus.cancelled,
               error: '已取消',
             );
-          } else {
-            _failCount++;
-            _lastError = '$e';
-            await UploadHistory.markFinished(
-              id: hid,
-              status: UploadStatus.failed,
-              error: '$e',
-            );
+          } on ApiException catch (e) {
+            // 进入网络等待前先停看门狗：否则等待期间 lastMoveAt 不再更新，
+            // 超过 _stallTimeout 它会误判"卡死"→ cancel 整个批次 token →
+            // _doRetryProbe 见 token.isCancelled 提前放弃重试，剩余文件全被标成已取消。
+            watchdog.cancel();
+            if (!token.isCancelled && _isNetworkError(e)) {
+              _inflightBytes[slot] = 0;
+              final restored = await _waitForConnection(token);
+              if (restored && !token.isCancelled) {
+                retryable = true;
+                continue;
+              }
+            }
+            if (token.isCancelled) {
+              _cancelCount++;
+              await UploadHistory.markFinished(
+                id: hid,
+                status: UploadStatus.cancelled,
+                error: '已取消',
+              );
+            } else {
+              _failCount++;
+              _lastError = e.displayMessage;
+              await UploadHistory.markFinished(
+                id: hid,
+                status: UploadStatus.failed,
+                error: e.displayMessage,
+              );
+            }
+          } on Object catch (e) {
+            watchdog.cancel(); // 同上：进入网络等待前先停看门狗
+            if (token.isCancelled) {
+              _cancelCount++;
+              await UploadHistory.markFinished(
+                id: hid,
+                status: UploadStatus.cancelled,
+                error: '已取消',
+              );
+            } else if (_looksLikeNetworkError(e)) {
+              _inflightBytes[slot] = 0;
+              final restored = await _waitForConnection(token);
+              if (restored && !token.isCancelled) {
+                retryable = true;
+                continue;
+              }
+              if (token.isCancelled) {
+                _cancelCount++;
+                await UploadHistory.markFinished(
+                  id: hid,
+                  status: UploadStatus.cancelled,
+                  error: '已取消',
+                );
+              } else {
+                _failCount++;
+                _lastError = '网络超时';
+                await UploadHistory.markFinished(
+                  id: hid,
+                  status: UploadStatus.failed,
+                  error: '网络超时',
+                );
+              }
+            } else {
+              _failCount++;
+              _lastError = '$e';
+              await UploadHistory.markFinished(
+                id: hid,
+                status: UploadStatus.failed,
+                error: '$e',
+              );
+            }
+          } finally {
+            watchdog.cancel();
           }
-        } finally {
-          watchdog.cancel();
         }
 
         // 这个文件结束：把它的字节数并进已完成基数
@@ -369,6 +487,14 @@ class UploadManager extends ChangeNotifier {
     }
     return result;
   }
+
+  static bool _isNetworkError(ApiException e) =>
+      e.kind == ApiErrorKind.network || e.kind == ApiErrorKind.timeout;
+
+  static bool _looksLikeNetworkError(Object e) =>
+      e is SocketException ||
+      e is TimeoutException ||
+      e is http.ClientException;
 
   /// 进度字节回调里用：节流到 ~4 次/秒，既保证进度条平滑，又不刷爆 UI。
   /// 高速上传时 onSent 每秒能来上千次，每次都 notify 会把渲染线程拖垮。
